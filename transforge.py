@@ -530,6 +530,29 @@ class Translator:
         return p
 
     # ---- frontmatter
+    def _mt_text(self, text, lang):
+        """Plain-text translation of one string via a pure-MT prompt (no JSON
+        round-trip — MT specialists emit unescaped CJK quotes inside JSON)."""
+        s = self.site
+        prompt = (f"Translate the following segment into {s.lang_name(lang)}, "
+                  "without additional explanation.")
+        if self._terms():
+            prompt += (f" Keep these terms exactly as written: {self._terms()}. "
+                       "Keep code fragments, file paths and commands as-is.")
+        if self._style(lang):
+            prompt += f" {self._style(lang)}"
+        prompt += "\n\n" + text
+        messages = [{"role": "user", "content": prompt}]
+        data = self.rig.chat(messages, s.max_tokens_fm, s.temperature)
+        choice = data["choices"][0]
+        out = choice["message"]["content"].strip()
+        if choice.get("finish_reason") == "length" or not out:
+            data = self.rig.chat(messages, s.max_tokens_fm_retry, s.temperature)
+            out = data["choices"][0]["message"]["content"].strip()
+        if not out:
+            raise RuntimeError("empty frontmatter field translation")
+        return out
+
     def translate_frontmatter(self, fm_text, lang):
         s = self.site
         orig = yaml.safe_load(fm_text)
@@ -538,6 +561,23 @@ class Translator:
         keys = [k for k in s.translate_fields if k in orig]
         if not keys:
             return fm_text.strip()
+        if s.prompt_template == "hunyuan-mt":
+            # field-by-field plain text: item counts hold by construction
+            translated = {}
+            for k in keys:
+                v = orig[k]
+                if isinstance(v, str) and v.strip():
+                    translated[k] = self._mt_text(v, lang)
+                elif isinstance(v, list):
+                    translated[k] = [self._mt_text(x, lang)
+                                     if isinstance(x, str) and x.strip() else x
+                                     for x in v]
+                else:
+                    continue
+            merged = dict(orig)
+            merged.update(translated)
+            return yaml.safe_dump(merged, allow_unicode=True, sort_keys=False,
+                                  default_flow_style=False).strip()
         sys_prompt = self.fm_prompt(keys, lang)
         messages = [{"role": "system", "content": sys_prompt},
                     {"role": "user", "content": fm_text}]
