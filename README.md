@@ -98,6 +98,8 @@ transforge warmup [--site X]                  load the model on a sane plan
 transforge models                             rig models, with loaded plans
 transforge report [--append FILE]             one-shot text report (cron-friendly)
 transforge config [--site X]                  resolved config + cfg_hash
+transforge review [--site X] [--langs ..] [--files ..] [--dry-run]
+                  [--include-edited] [--limit N]
 ```
 
 `--site` may be omitted when the config defines exactly one site.
@@ -114,6 +116,7 @@ transforge single ~/notes/page.md --lang de --out /tmp/page.de.md
 transforge accept --site laserlloyd --all
 transforge verify --site laserlloyd
 transforge report --append ~/reports/translations.md
+transforge review --site laserlloyd --dry-run
 ```
 
 ## Switching models
@@ -181,6 +184,60 @@ by it: `/projects/foo/` becomes `/ja/projects/foo/` only when
 | 4 | Rig unreachable |
 | 5 | Configured model not present on the rig |
 | 6 | Rig leased by a benchmark holder — some or all jobs deferred |
+| 7 | `review`: the configured API-key environment variable is not set |
+
+## Optional review stage
+
+Translation is always local. `transforge review` is a separate, **opt-in**
+second pass that sends only the high-visibility part of each translated page —
+the summary frontmatter fields and the body intro through the first `tl;dr`
+callout — to an OpenAI-compatible API for correction. Everything below the fold
+stays untouched local-model output.
+
+It is off unless you enable it, and no endpoint, model or key is baked into the
+code: all three come from your config and environment.
+
+```toml
+[review]
+enabled = true
+base_url = "https://api.example.com"   # OpenAI-compatible root
+model = "your-reviewer-model"
+api_key_env = "YOUR_API_KEY"           # the variable NAME; the value is never logged
+sections = ["title", "excerpt", "description", "plain",
+            "you_setup", "llm_does", "llm_prompt", "intro_through_tldr"]
+max_tokens = 16384
+reasoning_effort = "none"   # sent only when non-empty
+timeout_s = 120
+
+[sites.example.review]                 # optional per-site override
+enabled = false
+```
+
+Guarantees, in the same spirit as the rest of the tool:
+
+- **Nothing leaves the machine unless you turn it on.** Sending anything to a
+  third party is your decision to make per site, and it should only ever be
+  content you already publish.
+- **Fail-closed.** A reply that will not parse, drops a key, changes a list's
+  length, injects a glossary term or breaks the structural checks is discarded:
+  the original text is kept, a `WARN` is printed and the exit code is 1.
+- **Surgical.** Only the reviewed sections are rewritten. Untouched frontmatter
+  fields and the whole body past the callout stay byte-for-byte identical, and
+  a document that will not survive a no-op splice unchanged is refused.
+- **Hand edits win.** An `EDITED` sibling is skipped. `--include-edited` reviews
+  one only when the newest backup proves the hand-edit lies outside every
+  reviewed section; otherwise it refuses and says which section overlapped.
+- **Idempotent.** The manifest records a hash of the reviewed sections plus the
+  reviewer model, so a second run sends nothing. Applying a review also updates
+  the sibling hash, so reviewed output is not later mistaken for a hand edit.
+
+On a *reasoning* model, remember that `max_tokens` covers the hidden reasoning:
+a model that thinks past the budget answers with an empty string. The client
+detects that and retries once with reasoning off and double the ceiling, but
+setting `reasoning_effort = "none"` up front is faster and cheaper.
+
+Start with `--dry-run`, which lists exactly what would be sent and makes no API
+calls at all.
 
 ## Tests
 

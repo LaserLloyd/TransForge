@@ -1287,12 +1287,17 @@ def main():
     p = sub.add_parser("report"); p.add_argument("--append")
     p = sub.add_parser("config"); p.add_argument("--site")
 
+    # cloud review stage lives in review.py (resolve through the install symlink)
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    import review as _review
+    _review.add_cli(sub)
+
     args = ap.parse_args()
     _, sites = load_config()
     fn = {"status": cmd_status, "plan": cmd_plan, "run": cmd_run,
           "single": cmd_single, "accept": cmd_accept, "verify": cmd_verify,
           "warmup": cmd_warmup, "models": cmd_models, "report": cmd_report,
-          "config": cmd_config}[args.cmd]
+          "config": cmd_config, "review": _review.cmd_review}[args.cmd]
     sys.exit(fn(args, sites))
 
 
