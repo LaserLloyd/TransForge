@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""TransForge — config-driven website translator on the local StudioForge rig.
+"""TransForge — config-driven website translator on a local LLM server.
 
 Point it at a local site tree; it discovers English source pages, decides which
 language siblings are MISSING or STALE via a content-hash manifest (never
-mtimes), translates only those through a configurable local model on StudioForge
-(the rig), verifies structure deterministically, and writes siblings atomically.
+mtimes), translates only those through a configurable model on your own
+StudioForge/llama.cpp server, verifies structure deterministically, and writes
+siblings atomically.
 Nothing is ever re-translated while its EN source hash is unchanged, and a
 hand-edited sibling is never overwritten without --force.
 
@@ -27,6 +28,11 @@ Commands:
 Exit codes: 0 ok · 1 translation/verify failures · 2 usage/config ·
             4 rig unreachable · 5 model missing on rig · 6 rig leased (backoff)
 """
+import sys
+
+if sys.version_info < (3, 11):
+    sys.exit("transforge needs Python 3.11+")
+
 import argparse
 import concurrent.futures
 import datetime as _dt
@@ -35,7 +41,6 @@ import json
 import os
 import re
 import shutil
-import sys
 import threading
 import time
 import tomllib
@@ -47,10 +52,21 @@ import yaml
 
 CONFIG_PATH = os.path.expanduser("~/.config/transforge/config.toml")
 STATE_DIR = os.path.expanduser("~/.local/state/transforge")
-GATEWAY_ENV = os.path.expanduser("~/.openclaw/gateway.systemd.env")
+# Optional fallback location for STUDIOFORGE_MCP_PIN (an OpenClaw install);
+# the environment variable takes precedence and is the portable way to set it.
+PIN_ENV_FILE = os.path.expanduser("~/.openclaw/gateway.systemd.env")
 
 # lease holders whose runs must not be disturbed (CrucibleForge doctrine)
 BENCH_LEASE_HOLDERS = ("crucibleforge", "gauntlet")
+
+USAGE_ERROR = 2
+
+
+def die(msg, code=USAGE_ERROR):
+    """Usage/config error: message on stderr, deterministic exit code."""
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
 
 DEFAULTS = {
     "endpoint": "http://localhost:1234",
@@ -108,7 +124,7 @@ class SiteConfig:
         merged.update(defaults or {})
         merged.update(site or {})
         self.raw = merged
-        self.root = os.path.expanduser(merged.get("root", "."))
+        self.root = os.path.normpath(os.path.expanduser(merged.get("root", ".")))
         self.content_dirs = merged.get("content_dirs", [])
         self.languages = merged.get("languages", [])
         self.lang_names = merged.get("lang_names", {})
@@ -125,6 +141,12 @@ class SiteConfig:
                   "max_tokens_body", "max_tokens_body_retry", "max_chunk_chars",
                   "extra_params"):
             setattr(self, k, merged[k])
+        if self.concurrency != "auto":
+            try:
+                self.concurrency = int(self.concurrency)
+            except (TypeError, ValueError):
+                die(f"site {name}: concurrency must be \"auto\" or an integer "
+                    f"(got {self.concurrency!r})")
 
     def lang_name(self, lang):
         return self.lang_names.get(lang, lang)
@@ -145,25 +167,28 @@ class SiteConfig:
 
 def load_config():
     if not os.path.isfile(CONFIG_PATH):
-        sys.exit(f"config not found: {CONFIG_PATH} (create it; see README)")
-    with open(CONFIG_PATH, "rb") as f:
-        cfg = tomllib.load(f)
+        die(f"config not found: {CONFIG_PATH} (create it; see README)")
+    try:
+        with open(CONFIG_PATH, "rb") as f:
+            cfg = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        die(f"config is not valid TOML: {CONFIG_PATH}: {e}")
     defaults = cfg.get("defaults", {})
     sites = {name: SiteConfig(name, defaults, sc)
              for name, sc in cfg.get("sites", {}).items()}
     if not sites:
-        sys.exit("config has no [sites.*] sections")
+        die("config has no [sites.*] sections")
     return defaults, sites
 
 
 def pick_site(sites, name):
     if name:
         if name not in sites:
-            sys.exit(f"unknown site '{name}' (have: {', '.join(sorted(sites))})")
+            die(f"unknown site '{name}' (have: {', '.join(sorted(sites))})")
         return sites[name]
     if len(sites) == 1:
         return next(iter(sites.values()))
-    sys.exit(f"--site required (have: {', '.join(sorted(sites))})")
+    die(f"--site required (have: {', '.join(sorted(sites))})")
 
 
 # ---------------------------------------------------------------- manifest
@@ -176,9 +201,14 @@ class Manifest:
         self.path = os.path.join(STATE_DIR, f"{site_name}-manifest.json")
         self.lock = threading.Lock()
         if os.path.isfile(self.path):
-            with open(self.path, encoding="utf-8") as f:
-                data = json.load(f)
-            self.entries = data.get("entries", {})
+            try:
+                with open(self.path, encoding="utf-8") as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                die(f"manifest is corrupt: {self.path}: {e}\n"
+                    f"delete it and re-run `transforge accept --site {site_name} "
+                    f"--all` to rebuild from the siblings on disk")
+            self.entries = data.get("entries", {}) if isinstance(data, dict) else {}
         else:
             self.entries = {}
 
@@ -190,9 +220,13 @@ class Manifest:
             self.entries[f"{rel_src}|{lang}"] = entry
 
     def prune(self, valid_keys):
+        """Drop entries whose source page or language no longer exists.
+        Returns the number removed."""
         with self.lock:
-            for k in [k for k in self.entries if k not in valid_keys]:
+            dead = [k for k in self.entries if k not in valid_keys]
+            for k in dead:
                 del self.entries[k]
+            return len(dead)
 
     def save(self):
         with self.lock:
@@ -266,8 +300,10 @@ class Rig:
         if pin:
             p = self.pin()
             if not p:
-                raise RuntimeError("STUDIOFORGE_MCP_PIN unavailable "
-                                   f"(expected in {GATEWAY_ENV})")
+                raise RuntimeError(
+                    "STUDIOFORGE_MCP_PIN unavailable — export it in the "
+                    "environment (the server's management PIN is required for "
+                    "model load/settings calls)")
             headers["X-MCP-Pin"] = p
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.base + path, data=data,
@@ -277,10 +313,13 @@ class Rig:
             return json.loads(raw) if raw else {}
 
     def pin(self):
+        """Management PIN: environment first, then an optional env-file."""
         if self._pin is None:
-            self._pin = ""
+            self._pin = os.environ.get("STUDIOFORGE_MCP_PIN", "").strip()
+            if self._pin:
+                return self._pin
             try:
-                for line in read_text(GATEWAY_ENV).splitlines():
+                for line in read_text(PIN_ENV_FILE).splitlines():
                     m = re.match(r"STUDIOFORGE_MCP_PIN=\"?([^\s\"]+)\"?", line.strip())
                     if m:
                         self._pin = m.group(1)
@@ -745,12 +784,18 @@ def _translation_exists(site, link_dir, slug, lang):
     ))
 
 
+def link_dirs_pattern(site):
+    """Alternation of the configured link dirs, each escaped — a dir name may
+    legitimately contain regex metacharacters (e.g. 'privacy-policy', 'c++')."""
+    return "|".join(re.escape(d) for d in site.link_dirs)
+
+
 def rewrite_internal_links(text, lang, site):
     """Prefix internal links with /<lang>/ ONLY when that translation exists
     on disk (deterministic, after the model runs — never asked of the model)."""
     if not site.link_dirs:
         return text
-    dirs = "|".join(site.link_dirs)
+    dirs = link_dirs_pattern(site)
 
     def _repl(m):
         link_dir, slug, trailing = m.group(1), m.group(2), m.group(3)
@@ -810,7 +855,7 @@ def verify_structure(src, out, lang, site):
         if a != b:
             problems.append(f"{name}: {a} -> {b}")
     if site.link_dirs:
-        dirs = "|".join(site.link_dirs)
+        dirs = link_dirs_pattern(site)
         bare_src = count(src, rf'href="/(?:{dirs})/')
         bare_out = count(out, rf'href="/(?:{dirs})/')
         pref_out = count(out, rf'href="/{re.escape(lang)}/(?:{dirs})/')
@@ -863,15 +908,25 @@ def build_jobs(site, manifest, langs, files, force):
     return jobs, rows
 
 
+def prune_manifest(manifest, rows):
+    """Forget manifest entries for sources/languages that no longer exist."""
+    removed = manifest.prune({f"{rel_src}|{lang}" for rel_src, lang in rows})
+    if removed:
+        manifest.save()
+        print(f"pruned {removed} stale manifest entry(ies)")
+    return removed
+
+
 def cmd_run(args, sites):
     site = pick_site(sites, args.site)
     manifest = Manifest(site.name)
     langs = args.langs or site.languages
     for l in langs:
         if l not in site.languages:
-            sys.exit(f"language '{l}' not configured for site {site.name}")
+            die(f"language '{l}' not configured for site {site.name}")
     files = normalize_files(site, args.files)
-    jobs, _ = build_jobs(site, manifest, langs, files, args.force)
+    jobs, rows = build_jobs(site, manifest, langs, files, args.force)
+    prune_manifest(manifest, rows)
     if args.limit:
         jobs = jobs[: args.limit]
     if not jobs:
@@ -892,9 +947,16 @@ def cmd_run(args, sites):
                 else max(1, int(site.concurrency))
         else:
             workers = warmup(site, rig)
+    except urllib.error.HTTPError as e:
+        # reachable, but the server refused: not an unreachable-rig condition
+        print(f"rig returned HTTP {e.code} {e.reason} for {e.url}", file=sys.stderr)
+        return 1
     except (urllib.error.URLError, OSError) as e:
         print(f"rig unreachable: {e}", file=sys.stderr)
         return 4
+    except RuntimeError as e:
+        print(f"warmup failed: {e}", file=sys.stderr)
+        return 1
     if args.workers:
         workers = max(1, args.workers)
     print(f"workers: {workers}")
@@ -972,13 +1034,21 @@ def cmd_run(args, sites):
     return 6 if results["leased"] else 0
 
 
+def under_root(path, root):
+    """True only for a real descendant of root — a plain startswith() would
+    also match a sibling directory sharing the name prefix."""
+    root = os.path.normpath(root)
+    path = os.path.normpath(path)
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
 def normalize_files(site, files):
     if not files:
         return None
     out = []
     for f in files:
         p = os.path.abspath(os.path.expanduser(f))
-        rel = os.path.relpath(p, site.root) if p.startswith(site.root + os.sep) else f
+        rel = os.path.relpath(p, site.root) if under_root(p, site.root) else f
         out.append(rel)
     return out
 
@@ -993,6 +1063,7 @@ def cmd_status(args, sites):
     for site in targets:
         manifest = Manifest(site.name)
         rows = scan_site(site, manifest)
+        prune_manifest(manifest, rows)
         counts = {}
         for (rel_src, lang), (state, _) in rows.items():
             counts.setdefault(lang, {s: 0 for s in STATE_ORDER})[state] += 1
@@ -1084,7 +1155,7 @@ def cmd_single(args, sites):
     src_abs = os.path.abspath(os.path.expanduser(args.file))
     site = None
     for s in sites.values():
-        if src_abs.startswith(s.root + os.sep):
+        if under_root(src_abs, s.root):
             site = s
             break
     site = site or (pick_site(sites, args.site) if args.site else next(iter(sites.values())))

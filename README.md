@@ -1,7 +1,8 @@
 # TransForge
 
-Config-driven website translator that runs entirely against a local StudioForge
-LLM server (the rig, `http://localhost:1234`). No cloud API, no per-word cost.
+Config-driven website translator that runs entirely against your own
+StudioForge/llama.cpp LLM server (e.g. `http://localhost:1234`). No cloud API,
+no per-word cost.
 
 It discovers English source pages in a site tree, decides which language
 siblings are missing or stale using a **content-hash manifest** (never mtimes),
@@ -23,7 +24,7 @@ Sibling naming: `content/projects/foo.md` → `content/projects/foo.ja.md`.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `endpoint` | `http://localhost:1234` | StudioForge base URL |
+| `endpoint` | `http://localhost:1234` | Base URL of your StudioForge/llama.cpp server, e.g. `http://localhost:1234` |
 | `model` | `unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q5_K_S` | Full StudioForge model id (`publisher/repo/file-stem`) |
 | `concurrency` | `"auto"` | `"auto"` = follow the server's parallel slots; an integer caps it (still clamped to the live slot count) |
 | `ctx_per_slot` | `16384` | Context per slot requested at warmup |
@@ -152,9 +153,10 @@ Worker count is the model's live `parallel` slot count when
 `concurrency = "auto"`, otherwise `min(concurrency, parallel)`. `--workers N`
 overrides it. Smaller `ctx_per_slot` generally buys more slots.
 
-Steps 3–4 need `STUDIOFORGE_MCP_PIN`, read from
-`~/.openclaw/gateway.systemd.env` and sent as `X-MCP-Pin`. Without it TransForge
-warns and runs serially against whatever plan the rig chooses.
+Steps 3–4 need the server's management PIN, sent as `X-MCP-Pin`. It is read
+from the `STUDIOFORGE_MCP_PIN` environment variable, falling back to
+`~/.openclaw/gateway.systemd.env` if that file exists. Without it TransForge
+warns and runs serially against whatever plan the server chooses.
 
 ## Structural verification
 
@@ -178,7 +180,7 @@ by it: `/projects/foo/` becomes `/ja/projects/foo/` only when
 | 2 | Usage or config error |
 | 4 | Rig unreachable |
 | 5 | Configured model not present on the rig |
-| 6 | Rig leased by a benchmark holder — backed off, nothing done |
+| 6 | Rig leased by a benchmark holder — some or all jobs deferred |
 
 ## Tests
 

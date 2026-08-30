@@ -5,6 +5,7 @@ Run from the repo root:  python3 -m unittest discover -s tests
 import importlib.util
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -468,10 +469,6 @@ class TestMisc(unittest.TestCase):
         self.assertEqual(s.lang_name("xx"), "xx")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestGlossaryDeltas(unittest.TestCase):
     def setUp(self):
         self.site = make_site(no_translate=["OpenClaw", "Kiwix", "dsh"])
@@ -523,3 +520,157 @@ class TestGlossaryDeltas(unittest.TestCase):
             "Reasonix, the Claude-Code-style agent",
             "Claude Codeスタイルのエージェント", site)
         self.assertEqual(inj, [])
+
+
+# ------------------------------------------------------------- exit codes
+class TestUsageExitCodes(unittest.TestCase):
+    """Usage/config errors must exit 2, not the bare sys.exit(str) default 1."""
+
+    def test_unknown_site_exits_2(self):
+        with self.assertRaises(SystemExit) as cm:
+            tf.pick_site({"a": object()}, "nope")
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_ambiguous_site_exits_2(self):
+        with self.assertRaises(SystemExit) as cm:
+            tf.pick_site({"a": object(), "b": object()}, None)
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_missing_config_exits_2(self):
+        orig = tf.CONFIG_PATH
+        tf.CONFIG_PATH = os.path.join(tempfile.gettempdir(), "no-such-transforge.toml")
+        self.addCleanup(lambda: setattr(tf, "CONFIG_PATH", orig))
+        with self.assertRaises(SystemExit) as cm:
+            tf.load_config()
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_bad_toml_exits_2(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "config.toml")
+            write(p, "[defaults\nmodel = broken\n")
+            orig = tf.CONFIG_PATH
+            tf.CONFIG_PATH = p
+            self.addCleanup(lambda: setattr(tf, "CONFIG_PATH", orig))
+            with self.assertRaises(SystemExit) as cm:
+                tf.load_config()
+            self.assertEqual(cm.exception.code, 2)
+
+    def test_no_sites_exits_2(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "config.toml")
+            write(p, "[defaults]\nmodel = \"m\"\n")
+            orig = tf.CONFIG_PATH
+            tf.CONFIG_PATH = p
+            self.addCleanup(lambda: setattr(tf, "CONFIG_PATH", orig))
+            with self.assertRaises(SystemExit) as cm:
+                tf.load_config()
+            self.assertEqual(cm.exception.code, 2)
+
+    def test_bad_concurrency_exits_2(self):
+        with self.assertRaises(SystemExit) as cm:
+            make_site(concurrency="lots")
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_numeric_string_concurrency_is_coerced(self):
+        self.assertEqual(make_site(concurrency="4").concurrency, 4)
+        self.assertEqual(make_site(concurrency=4).concurrency, 4)
+        self.assertEqual(make_site().concurrency, "auto")
+
+    def test_corrupt_manifest_exits_2(self):
+        with tempfile.TemporaryDirectory() as d:
+            orig = tf.STATE_DIR
+            tf.STATE_DIR = d
+            self.addCleanup(lambda: setattr(tf, "STATE_DIR", orig))
+            write(os.path.join(d, "s-manifest.json"), "{not json")
+            with self.assertRaises(SystemExit) as cm:
+                tf.Manifest("s")
+            self.assertEqual(cm.exception.code, 2)
+
+
+# ------------------------------------------------------- link-dir escaping
+class TestLinkDirEscaping(unittest.TestCase):
+    """A link dir may contain regex metacharacters; it must be escaped, and
+    it must not accidentally match a similar-looking path."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = self.tmp.name
+        write(os.path.join(self.root, "content/c++/foo.md"), "<p>x</p>\n")
+        write(os.path.join(self.root, "content/c++/foo.ja.md"), "<p>x</p>\n")
+        self.site = make_site(
+            root=self.root, content_dirs=["content/c++"],
+            pages_dir="content/pages", link_dirs=["c++"], languages=["ja"])
+
+    def test_pattern_is_escaped(self):
+        self.assertEqual(tf.link_dirs_pattern(self.site), re.escape("c++"))
+
+    def test_metachar_dir_is_rewritten(self):
+        text = '<a href="/c++/foo/">Foo</a>'
+        self.assertEqual(tf.rewrite_internal_links(text, "ja", self.site),
+                         '<a href="/ja/c++/foo/">Foo</a>')
+
+    def test_metachar_dir_does_not_match_regex_expansion(self):
+        # unescaped, "c++" would match "c" followed by one-or-more "+"
+        text = '<a href="/c/foo/">C</a>'
+        self.assertEqual(tf.rewrite_internal_links(text, "ja", self.site), text)
+
+
+# ------------------------------------------------------------ path helpers
+class TestUnderRoot(unittest.TestCase):
+    def test_descendant(self):
+        self.assertTrue(tf.under_root("/a/site/content/x.md", "/a/site"))
+
+    def test_same_path(self):
+        self.assertTrue(tf.under_root("/a/site", "/a/site"))
+
+    def test_prefix_sibling_is_not_under_root(self):
+        self.assertFalse(tf.under_root("/a/site-backup/x.md", "/a/site"))
+
+    def test_trailing_slash_root(self):
+        self.assertTrue(tf.under_root("/a/site/x.md", "/a/site/"))
+
+    def test_normalize_files_rejects_prefix_sibling(self):
+        site = make_site(root="/a/site")
+        self.assertEqual(tf.normalize_files(site, ["/a/site/content/x.md"]),
+                         ["content/x.md"])
+        self.assertEqual(tf.normalize_files(site, ["/a/site-backup/content/x.md"]),
+                         ["/a/site-backup/content/x.md"])
+
+
+# --------------------------------------------------------- manifest prune
+class TestPruneManifest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        orig = tf.STATE_DIR
+        tf.STATE_DIR = os.path.join(self.tmp.name, "state")
+        self.addCleanup(lambda: setattr(tf, "STATE_DIR", orig))
+
+    def test_prune_returns_removed_count(self):
+        m = tf.Manifest("s")
+        m.set("a.md", "ja", {"src_sha": "s"})
+        m.set("gone.md", "ja", {"src_sha": "s"})
+        self.assertEqual(m.prune({"a.md|ja"}), 1)
+        self.assertEqual(m.prune({"a.md|ja"}), 0)
+
+    def test_prune_manifest_persists(self):
+        m = tf.Manifest("s")
+        m.set("a.md", "ja", {"src_sha": "s"})
+        m.set("gone.md", "ja", {"src_sha": "s"})
+        m.save()
+        removed = tf.prune_manifest(m, [("a.md", "ja")])
+        self.assertEqual(removed, 1)
+        self.assertIsNone(tf.Manifest("s").get("gone.md", "ja"))
+        self.assertIsNotNone(tf.Manifest("s").get("a.md", "ja"))
+
+    def test_prune_manifest_noop_leaves_entries(self):
+        m = tf.Manifest("s")
+        m.set("a.md", "ja", {"src_sha": "s"})
+        m.save()
+        self.assertEqual(tf.prune_manifest(m, [("a.md", "ja")]), 0)
+        self.assertIsNotNone(tf.Manifest("s").get("a.md", "ja"))
+
+
+if __name__ == "__main__":
+    unittest.main()
