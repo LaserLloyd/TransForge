@@ -1,0 +1,18 @@
+[project]
+name = "transforge"
+version = "0.1.0"
+description = "Config-driven website translator running against a local LLM server"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = ["PyYAML>=6"]
+
+[project.scripts]
+transforge = "transforge:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["transforge"]
