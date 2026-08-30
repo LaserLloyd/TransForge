@@ -17,6 +17,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
-        run: pip install pyyaml
+        run: pip install pyyaml ruff
+      - name: Lint (syntax and undefined names)
+        run: ruff check --select E9,F .
       - name: Run tests
         run: python3 -m unittest discover -s tests
