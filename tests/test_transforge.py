@@ -470,3 +470,56 @@ class TestMisc(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGlossaryDeltas(unittest.TestCase):
+    def setUp(self):
+        self.site = make_site(no_translate=["OpenClaw", "Kiwix", "dsh"])
+
+    def test_no_terms_no_findings(self):
+        inj, inc = tf.glossary_deltas("plain text", "プレーンテキスト", self.site)
+        self.assertEqual((inj, inc), ([], []))
+
+    def test_injection_detected(self):
+        inj, inc = tf.glossary_deltas(
+            "ask your assistant to search",
+            "OpenClaw に検索を頼んでください", self.site)
+        self.assertEqual(inj, ["OpenClaw (0 -> 1)"])
+        self.assertEqual(inc, [])
+
+    def test_increase_is_warning_not_injection(self):
+        inj, inc = tf.glossary_deltas(
+            "Kiwix serves the files; it is fast.",
+            "Kiwix がファイルを配信します。Kiwix は高速です。", self.site)
+        self.assertEqual(inj, [])
+        self.assertEqual(inc, ["Kiwix (1 -> 2)"])
+
+    def test_word_boundaries(self):
+        # "dsh" inside another ASCII word must not count
+        inj, inc = tf.glossary_deltas("the goldshine tool", "goldshine ツール", self.site)
+        self.assertEqual((inj, inc), ([], []))
+        inj, _ = tf.glossary_deltas("a tool", "dsh というツール", self.site)
+        self.assertEqual(inj, ["dsh (0 -> 1)"])
+
+    def test_verify_structure_fails_on_injection(self):
+        problems = tf.verify_structure(
+            "<p>ask your assistant</p>", "<p>OpenClaw に頼む</p>", "ja", self.site)
+        self.assertTrue(any("glossary term injected" in p for p in problems))
+
+    def test_verify_structure_allows_increase(self):
+        problems = tf.verify_structure(
+            "<p>Kiwix serves files; it is fast. 日本語</p>",
+            "<p>Kiwix がファイルを配信します。Kiwix は高速です。これは十分に長い日本語の段落であり、"
+            "サイズ比の下限チェックを満たすための追加の文章です。構造は同一です。"
+            "さらに文章を続けて、二百文字の最小サイズ下限を確実に超えるようにします。"
+            "この段落には見出しもコードブロックもリンクも含まれていないため、"
+            "構造検証は文字数と用語の増加のみを評価します。まだ足りない場合に備えて、"
+            "もう一文だけ追加しておきます。これで十分な長さになったはずです。</p>", "ja", self.site)
+        self.assertEqual(problems, [])
+
+    def test_hyphenated_source_variant_not_injection(self):
+        site = make_site(no_translate=["Claude Code"])
+        inj, inc = tf.glossary_deltas(
+            "Reasonix, the Claude-Code-style agent",
+            "Claude Codeスタイルのエージェント", site)
+        self.assertEqual(inj, [])

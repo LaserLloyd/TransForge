@@ -765,8 +765,35 @@ def rewrite_internal_links(text, lang, site):
     return re.sub(rf'href="/({dirs})/([^"/]*)(/?)', _repl, text)
 
 
+def _term_re(term):
+    # ASCII word-ish boundaries so "dsh" can't match inside another word while
+    # CJK/Arabic context (non-ASCII) never suppresses a match. Inside a
+    # multi-word term, hyphens/dashes count as the space ("Claude-Code-style"
+    # in EN must satisfy "Claude Code" in the output).
+    body = r"[\s\-‐-―]+".join(re.escape(w) for w in term.split())
+    return re.compile(r"(?<![A-Za-z0-9])" + body + r"(?![A-Za-z0-9])")
+
+
+def glossary_deltas(src, out, site):
+    """(injected, increased): no_translate terms the model INJECTED (present in
+    the output, absent from the source — the Hy-MT2 'OpenClaw' bleed class) vs
+    merely used more often (usually legit: CJK swaps a pronoun for the noun)."""
+    injected, increased = [], []
+    for term in site.no_translate:
+        a = len(_term_re(term).findall(src))
+        b = len(_term_re(term).findall(out))
+        if b and not a:
+            injected.append(f"{term} (0 -> {b})")
+        elif b > a:
+            increased.append(f"{term} ({a} -> {b})")
+    return injected, increased
+
+
 def verify_structure(src, out, lang, site):
     problems = []
+    injected, _ = glossary_deltas(src, out, site)
+    if injected:
+        problems.append("glossary term injected by model: " + ", ".join(injected))
     checks = [
         ("headings h2/h3", r"<h[23][\s>]"),
         ("svg open", r"<svg[\s>]"), ("svg close", r"</svg>"),
@@ -874,9 +901,27 @@ def cmd_run(args, sites):
 
     tr = Translator(site, rig)
     stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    results = {"ok": 0, "fail": 0}
+    results = {"ok": 0, "fail": 0, "leased": 0}
     lock = threading.Lock()
     t_start = time.time()
+    lease_state = {"checked": time.time(), "stop": False}
+
+    def lease_gate():
+        """Throttled bench-lease re-check between jobs: once a CrucibleForge/
+        gauntlet lease appears mid-run, stop starting new jobs."""
+        with lock:
+            if lease_state["stop"]:
+                return True
+            if time.time() - lease_state["checked"] < 60:
+                return False
+            lease_state["checked"] = time.time()
+        lease = rig.bench_lease()
+        if lease:
+            with lock:
+                lease_state["stop"] = True
+                lease_state["holder"] = lease.get("holder")
+            return True
+        return False
 
     def one(job):
         rel_src, lang, state, src_sha = job
@@ -884,8 +929,13 @@ def cmd_run(args, sites):
         out_rel = sibling_path(rel_src, lang)
         out_abs = os.path.join(site.root, out_rel)
         t0 = time.time()
+        if lease_gate():
+            with lock:
+                results["leased"] += 1
+            print(f"SKIP [{state:>16}] {lang} {rel_src}: rig leased by "
+                  f"'{lease_state.get('holder', '?')}' — backing off", file=sys.stderr)
+            return
         try:
-            # re-check bench lease cheaply between jobs
             source_text = read_text(src_abs)
             out_text = tr.translate_document(source_text, lang)
             with lock:
@@ -900,6 +950,11 @@ def cmd_run(args, sites):
                 results["ok"] += 1
                 manifest.save()
             print(f"OK   [{state:>16}] {lang} {rel_src} ({dur:.0f}s)")
+            _, increased = glossary_deltas(source_text, out_text, site)
+            if increased:
+                print(f"WARN [{state:>16}] {lang} {rel_src}: glossary terms used "
+                      "more often than the source (spot-check for bleed): "
+                      + ", ".join(increased), file=sys.stderr)
         except Exception as e:
             with lock:
                 results["fail"] += 1
@@ -909,9 +964,12 @@ def cmd_run(args, sites):
         list(ex.map(one, jobs))
     manifest.save()
     dur = time.time() - t_start
-    print(f"done: {results['ok']} ok, {results['fail']} failed in {dur:.0f}s "
+    print(f"done: {results['ok']} ok, {results['fail']} failed, "
+          f"{results['leased']} deferred (rig leased) in {dur:.0f}s "
           f"({workers} workers)")
-    return 1 if results["fail"] else 0
+    if results["fail"]:
+        return 1
+    return 6 if results["leased"] else 0
 
 
 def normalize_files(site, files):
@@ -1007,10 +1065,16 @@ def cmd_verify(args, sites):
             out_abs = os.path.join(site.root, sibling_path(rel_src, lang))
             if not os.path.isfile(out_abs):
                 continue
-            problems = verify_structure(src, read_text(out_abs), lang, site)
+            out_text = read_text(out_abs)
+            problems = verify_structure(src, out_text, lang, site)
             if problems:
                 bad += 1
                 print(f"BAD {lang} {rel_src}: {'; '.join(problems)}")
+            _, increased = glossary_deltas(src, out_text, site)
+            if increased:
+                print(f"WARN {lang} {rel_src}: glossary terms used more often "
+                      f"than the source (spot-check for bleed): "
+                      + ", ".join(increased))
     print(f"verify: {bad} problem file(s)" if bad else "verify: all structural checks pass")
     return 1 if bad else 0
 
