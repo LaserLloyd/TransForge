@@ -701,15 +701,37 @@ class Translator:
                     out.append("\n\n".join(cur))
         return [c.strip() for c in out if c.strip()]
 
-    def translate_chunk(self, chunk, lang):
+    def translate_chunk(self, chunk, lang, _depth=0):
+        """Translate one body chunk under the FULL structural contract.
+
+        The contract used to cover only <a href> and src= counts, while the
+        whole-document gate (verify_structure) rejected on all fifteen
+        STRUCTURE_CHECKS markers. Anything else the model dropped or invented --
+        inline <code> spans above all -- therefore had no retry at all: the
+        first bad sample propagated straight to a hard document failure. That is
+        what failed `translate-web-changes` for es and zh on three consecutive
+        nights on the same code-dense article, with a DIFFERENT count each night
+        (es 46->49 then 46->48, zh 46->45 twice) -- i.e. recoverable model
+        nondeterminism reported as a permanent error. Retrying on the same
+        markers the document is judged by closes that gap; a chunk that still
+        will not come back faithful after three attempts is still a hard error.
+        """
         s = self.site
-        need_links = count(chunk, r'href="')
-        need_src = count(chunk, r'src="')
         budget = s.max_tokens_body
+        masked, spans = mask_code_spans(chunk)
         messages = [{"role": "system", "content": self.body_prompt(lang)},
-                    {"role": "user", "content": chunk}]
+                    {"role": "user", "content": masked}]
+        deltas = []
         for attempt in range(3):
-            data = self.rig.chat(messages, budget, s.temperature)
+            # First pass at the configured temperature (Hunyuan-MT's card asks
+            # for 0.7, and that is what makes the prose read naturally). A retry
+            # only ever happens because the output was structurally UNfaithful,
+            # and at that point fidelity beats fluency: sampling down makes the
+            # model far more literal, which is exactly the failure being fixed.
+            # Re-sending an identical request at an identical temperature is
+            # just asking the same dice to land differently.
+            temp = s.temperature if attempt == 0 else min(s.temperature, 0.2)
+            data = self.rig.chat(messages, budget, temp)
             choice = data["choices"][0]
             text = choice["message"]["content"].strip()
             if choice.get("finish_reason") == "length":
@@ -720,24 +742,45 @@ class Translator:
                      "Your previous output was cut off mid-way. Re-translate the "
                      "WHOLE chunk, complete."}]
                 continue
-            got_links = count(text, r'href="')
-            got_src = count(text, r'src="')
-            if got_links == need_links and got_src == need_src:
+            text = restore_code_spans(text, spans)
+            deltas = structure_deltas(chunk, text)
+            if not deltas:
                 return text
             if attempt < 2:
                 budget = s.max_tokens_body_retry
+                detail = "; ".join(f"{name} {a} -> {b}" for name, a, b in deltas)
                 messages = messages + [
                     {"role": "assistant", "content": text},
                     {"role": "user", "content":
-                     f"ERROR: the source chunk has {need_links} <a href> links and "
-                     f"{need_src} src= attributes, but your output has {got_links} "
-                     f"and {got_src}. Re-translate the WHOLE chunk from scratch. "
-                     "Every link and image must appear exactly once, byte-for-byte "
-                     "(same URL, same position). Never omit, merge, or reword any link."}]
+                     f"ERROR: your output changed the markup. Expected vs got: "
+                     f"{detail}. Re-translate the WHOLE chunk from scratch. Every "
+                     "HTML tag, link, image and inline <code> span must appear "
+                     "exactly once, byte-for-byte, in the same position. Translate "
+                     "only the human-readable prose between the tags; never omit, "
+                     "merge, add, reword or translate any tag, URL or code span."}]
                 continue
+            break
+        # Retries exhausted at this granularity. A pure-MT model has no real
+        # instruction surface -- a corrective conversation is close to a no-op
+        # for it -- but it IS reliably more faithful on a short segment: what it
+        # does to a 2 kB block of dense prose is paraphrase, and paraphrasing is
+        # where a placeholder gets dissolved. So escalate on SIZE rather than
+        # repeat the same failing request a fourth time: translate the block by
+        # its blank-line-separated parts and rejoin. Splitting is safe here
+        # because it happens on the MASKED text -- a <pre> block with blank
+        # lines inside it is a single placeholder by now and cannot be cut in
+        # half. Bounded depth, and a part that still fails raises for real.
+        if _depth < 2:
+            parts = [p for p in re.split(r"\n\s*\n", masked) if p.strip()]
+            if len(parts) > 1:
+                return "\n\n".join(
+                    self.translate_chunk(restore_code_spans(part, spans),
+                                         lang, _depth + 1)
+                    for part in parts)
+        if deltas:
             raise RuntimeError(
-                f"body chunk link mismatch after retries (href {need_links}->"
-                f"{got_links}, src {need_src}->{got_src})")
+                "body chunk structure mismatch after retries ("
+                + "; ".join(f"{name} {a}->{b}" for name, a, b in deltas) + ")")
         raise RuntimeError("body chunk still truncated after retries")
 
     def translate_body(self, body, lang):
@@ -773,6 +816,82 @@ def split_frontmatter(text):
 
 def count(text, pat):
     return len(re.findall(pat, text))
+
+
+# --------------------------------------------------------- code-span masking
+# Inline <code> and <pre><code> blocks are never translated, so they are never
+# SHOWN to the model: each is swapped for an opaque numbered placeholder and
+# pasted back verbatim afterwards.
+#
+# Asking the model to "copy code byte-for-byte" was not enough. Hy-MT2 treats
+# <code> as a semantic hint and PROPAGATES it: give it a chunk containing
+# <code>bench-llm</code> once plus the bare word bench-llm three more times in
+# prose, and it marks up the prose repeats too (inline code 3 -> 5). That is a
+# stable bias, not sampling noise -- it survived every retry -- and it is what
+# failed `translate-web-changes` for es and zh three nights running. It cannot
+# be prompted away on a pure-MT model whose instruction surface is one line.
+# A placeholder the model cannot interpret removes the temptation entirely and
+# makes the code-span count structurally guaranteed instead of merely checked.
+#
+# The placeholder is tag-shaped because tags and attributes are the one thing
+# this model already copies reliably (link and src counts never drift), and is
+# deliberately spelled so it matches none of the STRUCTURE_CHECKS patterns.
+BLOCK_CODE_RE = re.compile(r"<pre><code[^>]*>.*?</code></pre>", re.S)
+INLINE_CODE_RE = re.compile(r"<code[^>]*>(.*?)</code>", re.S)
+CODE_SPAN_RE = re.compile(
+    r"<pre><code[^>]*>.*?</code></pre>|<code[^>]*>.*?</code>", re.S)
+# Tolerant on the way back in: accept a dropped slash, extra whitespace, a
+# paired close, or a body the model rewrote (the body is discarded either way --
+# the ORIGINAL span is what gets pasted back).
+# Paired form first: with the bare-open alternative tried first, a real
+# <tfspan i="0">body</tfspan> would match only its opening tag and leave the
+# body and close tag stranded in the output.
+CODE_PLACEHOLDER_RE = re.compile(
+    r'<tfspan\s+i="(\d+)"\s*>.*?</tfspan>'
+    r'|<tfspan\s+i="(\d+)"\s*/>'
+    r'|<tfspan\s+i="(\d+)"\s*>', re.S)
+
+
+def mask_code_spans(text):
+    """(masked_text, spans) — every code span replaced by a <tfspan i="N">
+    placeholder, keyed by index.
+
+    An INLINE span keeps its literal text inside the placeholder; a <pre> block
+    does not. That asymmetry is deliberate and was measured. A purely opaque
+    token is semantically empty, and an MT model paraphrasing a sentence simply
+    drops it -- Hy-MT2 turned "The tool is 1,660 lines of Python called
+    <code>bench-llm</code>" into "consta de 1,660 lineas de codigo Python",
+    losing the name and the span with it (inline code 1 -> 0), while the two
+    opaque placeholders in the same paragraph that sat next to content it cared
+    about survived. Leaving the text visible gives the model something it will
+    not throw away, and because restore pastes the ORIGINAL span back by index,
+    anything it does to that visible copy is discarded. <pre> blocks stay opaque:
+    they were never the ones being dropped, and inlining them would put blank
+    lines back inside a placeholder, which the subdivision fallback relies on
+    not happening.
+    """
+    spans = []
+
+    def _block(m):
+        spans.append(m.group(0))
+        return f'<tfspan i="{len(spans) - 1}"/>'
+
+    def _inline(m):
+        spans.append(m.group(0))
+        return f'<tfspan i="{len(spans) - 1}">{m.group(1)}</tfspan>'
+
+    return INLINE_CODE_RE.sub(_inline, BLOCK_CODE_RE.sub(_block, text)), spans
+
+
+def restore_code_spans(text, spans):
+    """Paste the original code spans back. An index the model invented or a
+    placeholder it mangled is left as-is, so the structural check still sees a
+    count mismatch and retries rather than silently shipping damaged markup."""
+    def _repl(m):
+        i = int(next(g for g in m.groups() if g is not None))
+        return spans[i] if 0 <= i < len(spans) else m.group(0)
+
+    return CODE_PLACEHOLDER_RE.sub(_repl, text)
 
 
 def _translation_exists(site, link_dir, slug, lang):
@@ -834,26 +953,41 @@ def glossary_deltas(src, out, site):
     return injected, increased
 
 
+# Structural markers whose count must survive translation byte-for-byte.
+# Shared by the per-chunk retry contract (translate_chunk) and the whole-document
+# gate (verify_structure) so the two can never drift apart: every invariant the
+# document is REJECTED for is an invariant a chunk gets RETRIED for first.
+STRUCTURE_CHECKS = [
+    ("headings h2/h3", r"<h[23][\s>]"),
+    ("svg open", r"<svg[\s>]"), ("svg close", r"</svg>"),
+    ("code blocks open", r"<pre><code>"), ("code blocks close", r"</code></pre>"),
+    ("inline code", r"<code[\s>]"),
+    ("tables open", r"<table[\s>]"), ("tables close", r"</table>"),
+    ("figures open", r"<figure[\s>]"), ("figures close", r"</figure>"),
+    ("images", r"<img[\s>]"),
+    ("links", r'href="'), ("src attrs", r'src="'),
+    ("svg path d=", r'd="'), ("svg text elements", r"<text[\s>]"),
+]
+
+
+def structure_deltas(src, out):
+    """[(name, expected, got)] for every STRUCTURE_CHECKS marker whose count
+    changed. Empty list == structurally faithful."""
+    deltas = []
+    for name, pat in STRUCTURE_CHECKS:
+        a, b = count(src, pat), count(out, pat)
+        if a != b:
+            deltas.append((name, a, b))
+    return deltas
+
+
 def verify_structure(src, out, lang, site):
     problems = []
     injected, _ = glossary_deltas(src, out, site)
     if injected:
         problems.append("glossary term injected by model: " + ", ".join(injected))
-    checks = [
-        ("headings h2/h3", r"<h[23][\s>]"),
-        ("svg open", r"<svg[\s>]"), ("svg close", r"</svg>"),
-        ("code blocks open", r"<pre><code>"), ("code blocks close", r"</code></pre>"),
-        ("inline code", r"<code[\s>]"),
-        ("tables open", r"<table[\s>]"), ("tables close", r"</table>"),
-        ("figures open", r"<figure[\s>]"), ("figures close", r"</figure>"),
-        ("images", r"<img[\s>]"),
-        ("links", r'href="'), ("src attrs", r'src="'),
-        ("svg path d=", r'd="'), ("svg text elements", r"<text[\s>]"),
-    ]
-    for name, pat in checks:
-        a, b = count(src, pat), count(out, pat)
-        if a != b:
-            problems.append(f"{name}: {a} -> {b}")
+    for name, a, b in structure_deltas(src, out):
+        problems.append(f"{name}: {a} -> {b}")
     if site.link_dirs:
         dirs = link_dirs_pattern(site)
         bare_src = count(src, rf'href="/(?:{dirs})/')

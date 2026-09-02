@@ -674,3 +674,329 @@ class TestPruneManifest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------- chunk structural contract
+CHUNK_SRC = (
+    '<h2>Setup</h2>\n'
+    '<p>Run <code>transforge status</code> then <code>transforge run</code>, '
+    'and read <a href="/projects/x/">the notes</a>.</p>\n'
+    '<pre><code>transforge run --site laserlloyd</code></pre>\n'
+    '<p><img src="/a.png"> a caption sentence with enough words to clear the floor.</p>'
+)
+
+
+def _es(text):
+    """A faithful-shaped Spanish rendering of CHUNK_SRC's prose."""
+    return (text.replace("Setup", "Instalación")
+                .replace("then", "y luego")
+                .replace("the notes", "las notas")
+                .replace("a caption sentence with enough words to clear the floor",
+                         "una frase de pie de foto con palabras suficientes"))
+
+
+class FakeRig:
+    """Returns a scripted reply per call; records the budgets it was asked for."""
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.calls = []
+
+    def chat(self, messages, max_tokens, temperature):
+        self.calls.append({"messages": messages, "max_tokens": max_tokens})
+        text, finish = self.replies.pop(0)
+        return {"choices": [{"message": {"content": text},
+                             "finish_reason": finish}]}
+
+
+class TestStructureDeltas(unittest.TestCase):
+    def test_faithful_output_has_no_deltas(self):
+        self.assertEqual(tf.structure_deltas(CHUNK_SRC, _es(CHUNK_SRC)), [])
+
+    def test_dropped_inline_code_is_a_delta(self):
+        out = _es(CHUNK_SRC).replace("<code>transforge status</code>", "transforge status")
+        self.assertIn(("inline code", 3, 2), tf.structure_deltas(CHUNK_SRC, out))
+
+    def test_invented_inline_code_is_a_delta(self):
+        out = _es(CHUNK_SRC).replace("las notas", "<code>las notas</code>")
+        self.assertIn(("inline code", 3, 4), tf.structure_deltas(CHUNK_SRC, out))
+
+    def test_verify_structure_reports_every_delta(self):
+        site = make_site(link_dirs=[])
+        out = _es(CHUNK_SRC).replace("<code>transforge status</code>", "transforge status")
+        problems = tf.verify_structure(CHUNK_SRC, out, "es", site)
+        self.assertTrue(any(p.startswith("inline code: 3 -> 2") for p in problems), problems)
+
+
+class TestTranslateChunkContract(unittest.TestCase):
+    """The regression that broke translate-web-changes for es/zh: an inline
+    <code> count drift is recoverable model noise, but had no retry — only
+    href/src did — so it surfaced as a hard document failure."""
+
+    def _translator(self, replies):
+        site = make_site(link_dirs=[], languages=["es"],
+                         lang_names={"es": "Spanish"})
+        rig = FakeRig(replies)
+        return tf.Translator(site, rig), rig
+
+    def test_faithful_first_try_returns_immediately(self):
+        good = _es(CHUNK_SRC)
+        tr, rig = self._translator([(good, "stop")])
+        self.assertEqual(tr.translate_chunk(CHUNK_SRC, "es"), good)
+        self.assertEqual(len(rig.calls), 1)
+
+    def test_inline_code_drift_is_retried_and_recovers(self):
+        bad = _es(CHUNK_SRC).replace("<code>transforge status</code>", "transforge status")
+        good = _es(CHUNK_SRC)
+        tr, rig = self._translator([(bad, "stop"), (good, "stop")])
+        self.assertEqual(tr.translate_chunk(CHUNK_SRC, "es"), good)
+        self.assertEqual(len(rig.calls), 2, "a code-count drift must be retried")
+        nudge = rig.calls[1]["messages"][-1]["content"]
+        self.assertIn("inline code 3 -> 2", nudge)
+
+    def test_persistent_drift_still_fails_hard(self):
+        bad = _es(CHUNK_SRC).replace("<code>transforge status</code>", "transforge status")
+        tr, rig = self._translator([(bad, "stop")] * 3)
+        with self.assertRaises(RuntimeError) as cm:
+            tr.translate_chunk(CHUNK_SRC, "es")
+        self.assertIn("inline code 3->2", str(cm.exception))
+        self.assertEqual(len(rig.calls), 3)
+
+    def test_link_drift_still_retried(self):
+        bad = _es(CHUNK_SRC).replace('<a href="/projects/x/">las notas</a>', "las notas")
+        good = _es(CHUNK_SRC)
+        tr, rig = self._translator([(bad, "stop"), (good, "stop")])
+        self.assertEqual(tr.translate_chunk(CHUNK_SRC, "es"), good)
+        self.assertIn("links 1 -> 0", rig.calls[1]["messages"][-1]["content"])
+
+    def test_truncation_retries_on_the_larger_budget(self):
+        good = _es(CHUNK_SRC)
+        tr, rig = self._translator([("cut off", "length"), (good, "stop")])
+        self.assertEqual(tr.translate_chunk(CHUNK_SRC, "es"), good)
+        self.assertGreater(rig.calls[1]["max_tokens"], rig.calls[0]["max_tokens"])
+
+    def test_contract_covers_every_document_gate_marker(self):
+        """translate_chunk and verify_structure must judge the same markers —
+        an invariant the document is rejected for with no chunk retry is
+        exactly the defect this test exists to prevent."""
+        self.assertEqual(
+            [n for n, _ in tf.STRUCTURE_CHECKS],
+            ["headings h2/h3", "svg open", "svg close",
+             "code blocks open", "code blocks close", "inline code",
+             "tables open", "tables close", "figures open", "figures close",
+             "images", "links", "src attrs", "svg path d=", "svg text elements"])
+
+
+# ------------------------------------------------------- code-span masking
+class TestMaskCodeSpans(unittest.TestCase):
+    def test_inline_and_block_spans_are_masked(self):
+        masked, spans = tf.mask_code_spans(CHUNK_SRC)
+        self.assertEqual(len(spans), 3)      # 2 inline + 1 <pre><code> block
+        self.assertNotIn("<code", masked)
+        self.assertEqual(masked.count("<tfspan"), 3)
+
+    def test_roundtrip_is_lossless(self):
+        masked, spans = tf.mask_code_spans(CHUNK_SRC)
+        self.assertEqual(tf.restore_code_spans(masked, spans), CHUNK_SRC)
+
+    def test_placeholder_matches_no_structure_check(self):
+        """A placeholder must be invisible to every counted marker, or masking
+        would corrupt the very check it exists to protect."""
+        masked, _ = tf.mask_code_spans(CHUNK_SRC)
+        for name, pat in tf.STRUCTURE_CHECKS:
+            self.assertEqual(
+                len(re.findall(pat, '<tfspan i="0"/>')), 0,
+                f"placeholder collides with the {name!r} pattern")
+        self.assertNotIn("<code", masked)
+
+    def test_tolerates_every_shape_the_model_might_return(self):
+        spans = ["<code>x</code>"]
+        for variant in ('<tfspan i="0"/>', '<tfspan i="0">',
+                        '<tfspan  i="0" />', '<tfspan i="0"></tfspan>',
+                        '<tfspan i="0">x</tfspan>',
+                        '<tfspan i="0">rewritten body</tfspan>'):
+            self.assertEqual(tf.restore_code_spans(f"<p>a {variant} b</p>", spans),
+                             "<p>a <code>x</code> b</p>", variant)
+
+    def test_invented_index_is_left_alone_for_the_checker_to_catch(self):
+        spans = ["<code>x</code>"]
+        out = tf.restore_code_spans('<p><tfspan i="9"/></p>', spans)
+        self.assertIn('<tfspan i="9"/>', out)
+        self.assertEqual(tf.count(out, r"<code[\s>]"), 0)
+
+
+class TestTranslateChunkMasking(unittest.TestCase):
+    def _translator(self, responder):
+        site = make_site(link_dirs=[], languages=["es"], lang_names={"es": "Spanish"})
+
+        class Rig:
+            def __init__(self):
+                self.seen = []
+
+            def chat(self, messages, max_tokens, temperature):
+                # messages[1] is the chunk under translation; messages[-1] on a
+                # retry is the corrective nudge, which must never be echoed.
+                self.seen.append(messages[1]["content"])
+                return {"choices": [{"message": {"content": responder(self.seen[-1])},
+                                     "finish_reason": "stop"}]}
+
+        rig = Rig()
+        return tf.Translator(site, rig), rig
+
+    def test_model_never_sees_a_code_tag(self):
+        tr, rig = self._translator(lambda sent: _es(sent))
+        out = tr.translate_chunk(CHUNK_SRC, "es")
+        self.assertNotIn("<code", rig.seen[0], "code spans must be masked before sending")
+        self.assertIn("<tfspan", rig.seen[0])
+        self.assertEqual(tf.count(out, r"<code[\s>]"), 3)
+        self.assertEqual(tf.count(out, r"<pre><code>"), 1)
+        self.assertNotIn("<tfspan", out, "placeholders must not survive into output")
+
+    def test_code_span_bodies_come_back_untouched(self):
+        """The live bug: the model marked up plain-text repeats of a token it
+        had seen inside <code>. With masking it cannot see the tag at all."""
+        src = ('<p>The tool is <code>bench-llm</code>. I used bench-llm daily and '
+               'bench-llm was retired; bench-llm still works fine for this.</p>')
+
+        def mangle(sent):
+            # Models the observed bias: the tag is only propagated onto bare
+            # repeats when the model can SEE a <code> tag in its input. Masking
+            # removes the cue, so this responder leaves the prose alone.
+            if "<code" not in sent:
+                return sent
+            return sent.replace("bench-llm", "<code>bench-llm</code>")
+
+        tr, _ = self._translator(mangle)
+        out = tr.translate_chunk(src, "es")
+        self.assertEqual(tf.count(out, r"<code[\s>]"), 1)
+        self.assertIn("<code>bench-llm</code>", out)
+
+
+class TestTranslateChunkSubdivision(unittest.TestCase):
+    """A pure-MT model paraphrases long blocks and dissolves placeholders.
+    Retrying the identical request cannot fix that; translating the block in
+    smaller parts can, and that is the escalation under test."""
+
+    MULTI = ('<p>Alpha uses <code>one</code> here.</p>\n\n'
+             '<p>Beta uses <code>two</code> here.</p>\n\n'
+             '<p>Gamma uses <code>three</code> here.</p>')
+
+    def _translator(self, responder):
+        site = make_site(link_dirs=[], languages=["es"], lang_names={"es": "Spanish"})
+
+        class Rig:
+            def __init__(self):
+                self.seen = []
+
+            def chat(self, messages, max_tokens, temperature):
+                # messages[1] is the chunk under translation; messages[-1] on a
+                # retry is the corrective nudge, which must never be echoed.
+                self.seen.append(messages[1]["content"])
+                return {"choices": [{"message": {"content": responder(self.seen[-1])},
+                                     "finish_reason": "stop"}]}
+
+        rig = Rig()
+        return tf.Translator(site, rig), rig
+
+    def test_drops_a_placeholder_on_a_long_block_but_not_a_short_one(self):
+        def responder(sent):
+            # Faithful on a single paragraph; drops the first placeholder when
+            # handed the whole multi-paragraph block. This is the live failure
+            # shape: <tfspan i="0"/> dissolved into paraphrased prose.
+            if sent.count("<p>") > 1:
+                return re.sub(r'<tfspan i="0"[^>]*>.*?</tfspan>', "uno",
+                              sent, count=1, flags=re.S)
+            return sent
+
+        tr, rig = self._translator(responder)
+        out = tr.translate_chunk(self.MULTI, "es")
+        self.assertEqual(tf.count(out, r"<code[\s>]"), 3)
+        self.assertEqual(tf.structure_deltas(self.MULTI, out), [])
+        self.assertEqual(len([s for s in rig.seen if s.count("<p>") > 1]), 3,
+                         "three whole-block attempts, then subdivision")
+        self.assertEqual(len([s for s in rig.seen if s.count("<p>") == 1]), 3,
+                         "one call per paragraph after escalation")
+
+    def test_indivisible_block_still_fails_hard(self):
+        single = '<p>Only <code>one</code> paragraph here, nothing to split on.</p>'
+        tr, rig = self._translator(
+            lambda sent: re.sub(r'<tfspan i="0"[^>]*>.*?</tfspan>', "uno",
+                                sent, flags=re.S))
+        with self.assertRaises(RuntimeError) as cm:
+            tr.translate_chunk(single, "es")
+        self.assertIn("inline code 1->0", str(cm.exception))
+
+    def test_subdivision_depth_is_bounded(self):
+        """A model that fails at every granularity must terminate, not recurse."""
+        tr, rig = self._translator(
+            lambda sent: re.sub(r'<tfspan i="0"[^>]*>.*?</tfspan>', "uno",
+                                sent, flags=re.S))
+        with self.assertRaises(RuntimeError):
+            tr.translate_chunk(self.MULTI, "es")
+        self.assertLess(len(rig.seen), 40, "recursion must be bounded")
+
+    def test_truncated_block_escalates_to_subdivision(self):
+        calls = {"n": 0}
+
+        class Rig:
+            def __init__(self):
+                self.seen = []
+
+            def chat(self, messages, max_tokens, temperature):
+                sent = messages[1]["content"]
+                self.seen.append(sent)
+                calls["n"] += 1
+                if sent.count("<p>") > 1:
+                    return {"choices": [{"message": {"content": "cut"},
+                                         "finish_reason": "length"}]}
+                return {"choices": [{"message": {"content": sent},
+                                     "finish_reason": "stop"}]}
+
+        site = make_site(link_dirs=[], languages=["es"], lang_names={"es": "Spanish"})
+        rig = Rig()
+        out = tf.Translator(site, rig).translate_chunk(self.MULTI, "es")
+        self.assertEqual(tf.count(out, r"<code[\s>]"), 3)
+
+
+class TestRetryTemperature(unittest.TestCase):
+    """A structural retry exists because the sample was unfaithful; repeating it
+    at the same temperature is asking the same dice to land differently."""
+
+    def test_first_try_uses_configured_temperature_retries_sample_down(self):
+        src = '<p>Alpha <code>one</code> beta gamma delta epsilon zeta.</p>'
+        temps = []
+
+        class Rig:
+            def chat(self, messages, max_tokens, temperature):
+                temps.append(temperature)
+                sent = messages[1]["content"]
+                # unfaithful on the first sample, faithful afterwards
+                body = (re.sub(r'<tfspan i="0"[^>]*>.*?</tfspan>', "uno", sent, flags=re.S)
+                        if len(temps) == 1 else sent)
+                return {"choices": [{"message": {"content": body},
+                                     "finish_reason": "stop"}]}
+
+        site = make_site(link_dirs=[], languages=["es"],
+                         lang_names={"es": "Spanish"}, temperature=0.7)
+        out = tf.Translator(site, Rig()).translate_chunk(src, "es")
+        self.assertEqual(tf.count(out, r"<code[\s>]"), 1)
+        self.assertEqual(temps[0], 0.7, "first pass keeps the configured temperature")
+        self.assertLessEqual(temps[1], 0.2, "retries must sample down for fidelity")
+
+    def test_a_low_configured_temperature_is_never_raised(self):
+        src = '<p>Alpha <code>one</code> beta gamma delta epsilon zeta.</p>'
+        temps = []
+
+        class Rig:
+            def chat(self, messages, max_tokens, temperature):
+                temps.append(temperature)
+                sent = messages[1]["content"]
+                body = (re.sub(r'<tfspan i="0"[^>]*>.*?</tfspan>', "uno", sent, flags=re.S)
+                        if len(temps) == 1 else sent)
+                return {"choices": [{"message": {"content": body},
+                                     "finish_reason": "stop"}]}
+
+        site = make_site(link_dirs=[], languages=["es"],
+                         lang_names={"es": "Spanish"}, temperature=0.05)
+        tf.Translator(site, Rig()).translate_chunk(src, "es")
+        self.assertEqual(temps[1], 0.05)
