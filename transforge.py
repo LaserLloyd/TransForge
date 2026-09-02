@@ -754,10 +754,11 @@ class Translator:
                     {"role": "user", "content":
                      f"ERROR: your output changed the markup. Expected vs got: "
                      f"{detail}. Re-translate the WHOLE chunk from scratch. Every "
-                     "HTML tag, link, image and inline <code> span must appear "
+                     "HTML tag, link, image and <tfspan> placeholder must appear "
                      "exactly once, byte-for-byte, in the same position. Translate "
                      "only the human-readable prose between the tags; never omit, "
-                     "merge, add, reword or translate any tag, URL or code span."}]
+                     "merge, add, reword or translate a tag, a URL or a "
+                     "placeholder."}]
                 continue
             break
         # Retries exhausted at this granularity. A pure-MT model has no real
@@ -766,14 +767,14 @@ class Translator:
         # does to a 2 kB block of dense prose is paraphrase, and paraphrasing is
         # where a placeholder gets dissolved. So escalate on SIZE rather than
         # repeat the same failing request a fourth time: translate the block by
-        # its blank-line-separated parts and rejoin. Splitting is safe here
+        # its parts (see subdivide_block) and rejoin. Splitting is safe here
         # because it happens on the MASKED text -- a <pre> block with blank
         # lines inside it is a single placeholder by now and cannot be cut in
         # half. Bounded depth, and a part that still fails raises for real.
         if _depth < 2:
-            parts = [p for p in re.split(r"\n\s*\n", masked) if p.strip()]
-            if len(parts) > 1:
-                return "\n\n".join(
+            parts, joiner = subdivide_block(masked)
+            if parts:
+                return joiner.join(
                     self.translate_chunk(restore_code_spans(part, spans),
                                          lang, _depth + 1)
                     for part in parts)
@@ -850,6 +851,50 @@ CODE_PLACEHOLDER_RE = re.compile(
     r'<tfspan\s+i="(\d+)"\s*>.*?</tfspan>'
     r'|<tfspan\s+i="(\d+)"\s*/>'
     r'|<tfspan\s+i="(\d+)"\s*>', re.S)
+
+
+def subdivide_block(text):
+    """(parts, joiner) for a block that would not translate faithfully whole,
+    or (None, None) when it genuinely cannot be cut.
+
+    Blank lines first, which is how the body is normally structured. But a
+    <ul> is ONE blank-line block no matter how long, and on this site that is
+    exactly where the code spans cluster -- the article that broke the nightly
+    has a six-item gotchas list carrying six <code> spans and no blank line
+    anywhere inside it, so blank-line splitting alone left it indivisible and
+    it failed hard. So fall back to item/row/paragraph boundaries, splitting
+    AFTER the closing tag so every part stays a whole item. Those parts rejoin
+    on a single newline, never a blank line: a blank line inside a raw <ul>
+    ends the HTML block for the site's markdown renderer.
+    """
+    parts = [p for p in re.split(r"\n\s*\n", text) if p.strip()]
+    if len(parts) > 1:
+        return parts, "\n\n"
+    for tag in ("</li>", "</tr>", "</p>"):
+        if text.count(tag) > 1:
+            pieces = [p for p in re.split(rf"(?<={re.escape(tag)})", text) if p.strip()]
+            pieces = _merge_textless(pieces)
+            if len(pieces) > 1:
+                return pieces, "\n"
+    return None, None
+
+
+def _merge_textless(pieces):
+    """Fold parts with nothing to translate into their neighbour.
+
+    Splitting after </li> leaves the closing </ul> as its own part. Sending a
+    part that is pure markup to a translator is a silent hole rather than a
+    waste: it carries none of the counted markers, so structure_deltas has
+    nothing to compare and whatever the model echoes back would be accepted.
+    Every part must contain real text."""
+    out = []
+    for piece in pieces:
+        has_text = re.search(r"[^\W_]", re.sub(r"<[^>]*>", "", piece), re.UNICODE)
+        if not has_text and out:
+            out[-1] += piece
+        else:
+            out.append(piece)
+    return out
 
 
 def mask_code_spans(text):

@@ -755,11 +755,14 @@ class TestTranslateChunkContract(unittest.TestCase):
         self.assertIn("inline code 3 -> 2", nudge)
 
     def test_persistent_drift_still_fails_hard(self):
-        bad = _es(CHUNK_SRC).replace("<code>transforge status</code>", "transforge status")
+        # A single <p> with no blank line and one closing tag cannot be
+        # subdivided, so this exercises the terminal failure path.
+        src = '<p>Alpha <code>uno</code> beta gamma delta epsilon zeta eta.</p>'
+        bad = src.replace("<code>uno</code>", "uno")
         tr, rig = self._translator([(bad, "stop")] * 3)
         with self.assertRaises(RuntimeError) as cm:
-            tr.translate_chunk(CHUNK_SRC, "es")
-        self.assertIn("inline code 3->2", str(cm.exception))
+            tr.translate_chunk(src, "es")
+        self.assertIn("inline code 1->0", str(cm.exception))
         self.assertEqual(len(rig.calls), 3)
 
     def test_link_drift_still_retried(self):
@@ -1000,3 +1003,69 @@ class TestRetryTemperature(unittest.TestCase):
                          lang_names={"es": "Spanish"}, temperature=0.05)
         tf.Translator(site, Rig()).translate_chunk(src, "es")
         self.assertEqual(temps[1], 0.05)
+
+
+class TestSubdivideBlock(unittest.TestCase):
+    def test_blank_lines_win_and_rejoin_with_a_blank_line(self):
+        parts, joiner = tf.subdivide_block("<p>one</p>\n\n<p>two</p>")
+        self.assertEqual(len(parts), 2)
+        self.assertEqual(joiner, "\n\n")
+
+    def test_a_list_with_no_blank_lines_splits_on_items(self):
+        """The shape that broke the nightly: one <ul>, six <code> spans, not a
+        blank line anywhere inside it."""
+        ul = ("<ul>\n"
+              + "".join(f"<li>item {i} uses <code>c{i}</code></li>\n" for i in range(6))
+              + "</ul>")
+        self.assertEqual(len(re.split(r"\n\s*\n", ul)), 1, "fixture must have no blank line")
+        parts, joiner = tf.subdivide_block(ul)
+        self.assertEqual(len(parts), 6)
+        self.assertEqual(joiner, "\n")
+
+    def test_table_rows_and_paragraphs_are_also_boundaries(self):
+        rows = "<table><tr><td>a</td></tr><tr><td>b</td></tr></table>"
+        self.assertEqual(len(tf.subdivide_block(rows)[0]), 2)
+        paras = "<p>one</p><p>two</p><p>three</p>"
+        self.assertEqual(len(tf.subdivide_block(paras)[0]), 3)
+
+    def test_a_markup_only_tail_is_folded_into_its_neighbour(self):
+        """Splitting after </li> leaves a bare </ul>; a part with no text has
+        no countable marker, so anything the model returned for it would be
+        accepted unchecked."""
+        ul = "<ul>\n<li>a <code>x</code></li>\n<li>b <code>y</code></li>\n</ul>"
+        parts, _ = tf.subdivide_block(ul)
+        self.assertEqual(len(parts), 2)
+        self.assertTrue(parts[-1].rstrip().endswith("</ul>"))
+        for part in parts:
+            self.assertRegex(re.sub(r"<[^>]*>", "", part), r"[^\W_]")
+
+    def test_rejoining_list_parts_never_inserts_a_blank_line(self):
+        """A blank line inside a raw <ul> ends the HTML block for the site's
+        markdown renderer, so the list join must stay a single newline."""
+        ul = "<ul>\n<li>a <code>x</code></li>\n<li>b <code>y</code></li>\n</ul>"
+        parts, joiner = tf.subdivide_block(ul)
+        self.assertNotIn("\n\n", joiner.join(p.strip() for p in parts))
+
+    def test_indivisible_block_reports_so(self):
+        self.assertEqual(tf.subdivide_block("<p>one single block</p>"), (None, None))
+
+    def test_list_block_recovers_end_to_end(self):
+        ul = ("<ul>\n"
+              + "".join(f"<li>item {i} uses <code>c{i}</code> here</li>\n" for i in range(6))
+              + "</ul>")
+
+        class Rig:
+            def chat(self, messages, max_tokens, temperature):
+                sent = messages[1]["content"]
+                # Faithful only once the list has been broken into single items.
+                if sent.count("<li>") > 1:
+                    return {"choices": [{"message": {"content": re.sub(
+                        r'<tfspan i="0"[^>]*>.*?</tfspan>', "gone", sent, flags=re.S)},
+                        "finish_reason": "stop"}]}
+                return {"choices": [{"message": {"content": sent},
+                                     "finish_reason": "stop"}]}
+
+        site = make_site(link_dirs=[], languages=["es"], lang_names={"es": "Spanish"})
+        out = tf.Translator(site, Rig()).translate_chunk(ul, "es")
+        self.assertEqual(tf.count(out, r"<code[\s>]"), 6)
+        self.assertNotIn("\n\n", out)
