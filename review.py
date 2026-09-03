@@ -505,6 +505,25 @@ def cmd_review(args, sites):
                 exit_code = 1
                 continue
             fixed, changed, kept = validate_reply(common, reply)
+            # Same deterministic post-model pass the TRANSLATION path runs
+            # (transforge.translate -> rewrite_internal_links): the model is
+            # never asked to prefix internal links with /<lang>/, so reviewer
+            # output arrives unprefixed and verify_structure rightly rejects
+            # it. Without this the whole review exits 1 on a defect the
+            # pipeline already knows how to fix -- `translate-web-changes`
+            # failed five nights running on exactly one such link.
+            # Scoped to the reviewed sections so untouched regions still can't
+            # move (the no-op splice check below).
+            def _prefix(v):
+                # A reviewed field is a string or a list of strings
+                # (frontmatter lists like you_setup).
+                if isinstance(v, list):
+                    return [_prefix(item) for item in v]
+                if isinstance(v, str):
+                    return tfmod.rewrite_internal_links(v, lang, site)
+                return v
+
+            fixed = {k: _prefix(v) for k, v in fixed.items()}
             if kept:
                 print(f"WARN {lang} {rel_src}: reviewer reply invalid for "
                       f"section(s) {', '.join(kept)} — originals kept",

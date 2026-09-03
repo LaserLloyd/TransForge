@@ -392,6 +392,46 @@ class TestCmdReview(ReviewHarness):
         state, _ = tf.classify(self.site, tf.Manifest("t"), self.src_rel, "ja")
         self.assertEqual(state, "CURRENT")
 
+    def test_reviewer_link_is_prefixed_instead_of_failing(self):
+        """The reviewer is never asked to write /<lang>/ links, so its output
+        arrives unprefixed and verify_structure rejects it — which used to fail
+        the whole run (translate-web-changes exited 1 five nights running on one
+        such link). The deterministic prefix pass now runs on reviewed sections
+        exactly as it does on translated ones."""
+        self.site.link_dirs = ["projects"]
+        self.write(os.path.join("content", "projects", "other.md"), "EN\n")
+        self.write(os.path.join("content", "projects", "other.ja.md"), "JA\n")
+        # The SOURCE carries the link, so the reviewer emitting one is not an
+        # invented link -- only its missing /ja/ prefix is at issue.
+        src = SRC_DOC.replace(
+            "Intro paragraph naming the article it read that in.",
+            'Intro paragraph with <a href="/projects/other/">another</a>.')
+        out_doc = JA_DOC.replace(
+            "冒頭の段落。",
+            '冒頭の段落 <a href="/ja/projects/other/">別記事</a>。')
+        self.write(self.src_rel, src)
+        self.write(self.out_rel, out_doc)
+        m = tf.Manifest("t")
+        m.set(self.src_rel, "ja", {
+            "src_sha": tf.sha256_text(src), "out_sha": tf.sha256_text(out_doc),
+            "cfg": self.site.cfg_hash(), "model": "local", "out": self.out_rel,
+            "translated_at": tf.now_iso(), "duration_s": 0})
+        m.save()
+        FakeClient.next_reply = json.dumps(
+            {"title": "ウィジェット", "excerpt": "短い。",
+             "plain": "クエリログのない説明。",
+             "you_setup": ["一台のマシン", "二台のディスク"],
+             "intro_through_tldr":
+             '冒頭の段落 <a href="/projects/other/">別の記事</a>。\n\n'
+             '<div class="callout">\n<p><strong>要約</strong></p>\n<ul>\n'
+             "<li>第一のポイント。</li>\n</ul>\n</div>"},
+            ensure_ascii=False)
+        self.assertEqual(self.run_review(), 0)
+        out = self.read(self.out_rel)
+        self.assertIn('href="/ja/projects/other/"', out)
+        self.assertNotIn('href="/projects/other/"', out)
+        self.assertIn("別の記事", out)
+
     def test_idempotent_second_run_skips(self):
         FakeClient.next_reply = json.dumps(
             {"title": "ウィジェット", "excerpt": "短い。",
