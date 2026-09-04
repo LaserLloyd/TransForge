@@ -59,6 +59,19 @@ PIN_ENV_FILE = os.path.expanduser("~/.openclaw/gateway.systemd.env")
 # lease holders whose runs must not be disturbed (CrucibleForge doctrine)
 BENCH_LEASE_HOLDERS = ("crucibleforge", "gauntlet")
 
+def _is_bench_holder(holder: str) -> bool:
+    """True for any CrucibleForge lease, including its phase-suffixed ones.
+
+    Exact membership was a hole: the benchmark leases the run as
+    "crucibleforge" but the JUDGE phase as **"crucibleforge-judge"**
+    (crucibleforge/judge.py: JUDGE_LEASE_HOLDER), so an exact test saw no lease
+    for the whole judging window and this side would have run straight into the
+    benchmark. Match the family prefix, not the literal string.
+    """
+    h = str(holder or "").strip().lower()
+    return h in BENCH_LEASE_HOLDERS or h.split("-", 1)[0] in BENCH_LEASE_HOLDERS
+
+
 USAGE_ERROR = 2
 
 
@@ -342,7 +355,7 @@ class Rig:
 
     def bench_lease(self):
         for l in self.leases():
-            if str(l.get("holder", "")).lower() in BENCH_LEASE_HOLDERS:
+            if _is_bench_holder(l.get("holder", "")):
                 return l
         return None
 
