@@ -2,7 +2,10 @@
 
 Run from the repo root:  python3 -m unittest discover -s tests
 """
+import argparse
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -10,6 +13,7 @@ import stat
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _spec = importlib.util.spec_from_file_location(
@@ -1069,3 +1073,382 @@ class TestSubdivideBlock(unittest.TestCase):
         out = tf.Translator(site, Rig()).translate_chunk(ul, "es")
         self.assertEqual(tf.count(out, r"<code[\s>]"), 6)
         self.assertNotIn("\n\n", out)
+
+
+# --------------------------------------------------- `transforge text` (2.8)
+class TestTranslateTextPrompt(unittest.TestCase):
+    """Translator.text_prompt() / translate_text() -- the request-building
+    path `transforge text` reuses. No HTML/JSON ever appears here (plain text
+    only, by spec)."""
+
+    def test_hunyuan_mt_is_terse_and_omits_source_by_default(self):
+        site = make_site(prompt_template="hunyuan-mt",
+                         lang_names={"ja": "Japanese"})
+        tr = tf.Translator(site, rig=None)
+        p = tr.text_prompt("ja")
+        self.assertIn("into Japanese", p)
+        self.assertNotIn("from ", p)
+
+    def test_hunyuan_mt_mentions_an_explicit_non_english_source(self):
+        site = make_site(prompt_template="hunyuan-mt",
+                         lang_names={"ja": "Japanese", "es": "Spanish"})
+        tr = tf.Translator(site, rig=None)
+        p = tr.text_prompt("ja", from_lang="es")
+        self.assertIn("from Spanish into Japanese", p)
+
+    def test_default_from_en_does_not_produce_a_from_clause(self):
+        """The CLI's own --from default is the literal string "en" (not
+        None) so the JSON output always names a source -- but the PROMPT
+        must still read as the tool's usual implicit-English default, not
+        literally "from en"."""
+        site = make_site(prompt_template="hunyuan-mt",
+                         lang_names={"ja": "Japanese"})
+        tr = tf.Translator(site, rig=None)
+        p = tr.text_prompt("ja", from_lang="en")
+        self.assertNotIn("from ", p)
+        self.assertNotIn(" en ", p)
+
+    def test_instruct_prompt_is_conversational_and_has_no_html_rules(self):
+        site = make_site(prompt_template="instruct", lang_names={"ja": "Japanese"})
+        tr = tf.Translator(site, rig=None)
+        p = tr.text_prompt("ja")
+        self.assertIn("professional translator", p)
+        self.assertIn("plain text", p)
+        for html_marker in ("<code>", "<pre>", "HTML", "JSON", "tag"):
+            self.assertNotIn(html_marker, p)
+
+    def test_terms_and_style_are_included_in_both_templates(self):
+        for template in ("hunyuan-mt", "instruct"):
+            site = make_site(prompt_template=template, lang_names={"ja": "Japanese"},
+                             no_translate=["OpenClaw"], style={"ja": "polite desu/masu"})
+            tr = tf.Translator(site, rig=None)
+            p = tr.text_prompt("ja")
+            self.assertIn("OpenClaw", p, template)
+            self.assertIn("polite desu/masu", p, template)
+
+    def test_translate_text_returns_stripped_reply(self):
+        site = make_site(lang_names={"ja": "Japanese"})
+        rig = FakeRig([("  Ohayo gozaimasu  ", "stop")])
+        tr = tf.Translator(site, rig)
+        self.assertEqual(tr.translate_text("Good morning", "ja"), "Ohayo gozaimasu")
+        self.assertEqual(rig.calls[0]["max_tokens"], site.max_tokens_body)
+
+    def test_translate_text_retries_on_truncation_with_the_body_retry_budget(self):
+        site = make_site(lang_names={"ja": "Japanese"})
+        rig = FakeRig([("cut off mid", "length"), ("Ohayo gozaimasu", "stop")])
+        tr = tf.Translator(site, rig)
+        self.assertEqual(tr.translate_text("Good morning", "ja"), "Ohayo gozaimasu")
+        self.assertEqual(len(rig.calls), 2)
+        self.assertEqual(rig.calls[1]["max_tokens"], site.max_tokens_body_retry)
+
+    def test_translate_text_raises_on_persistent_empty_output(self):
+        site = make_site(lang_names={"ja": "Japanese"})
+        rig = FakeRig([("", "stop"), ("", "stop")])
+        tr = tf.Translator(site, rig)
+        with self.assertRaises(RuntimeError):
+            tr.translate_text("Good morning", "ja")
+
+
+class _FakeHTTPResponse:
+    def __init__(self, payload):
+        self._payload = json.dumps(payload).encode("utf-8")
+
+    def read(self):
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class TestRigChatRequestBuilding(unittest.TestCase):
+    """The HTTP layer, mocked: proves the request-building path `text` reuses
+    (Rig.chat) really does put config temperature/extra_params (top_p/top_k/
+    repeat) and the site's model on the wire -- the rig is never required."""
+
+    def test_payload_carries_temperature_and_extra_params_from_config(self):
+        site = make_site(model="vendor/m", temperature=0.42,
+                         extra_params={"top_p": 0.6, "top_k": 20,
+                                      "repeat_penalty": 1.05})
+        rig = tf.Rig(site)
+        captured = {}
+
+        def fake_urlopen(req, timeout=30):
+            captured["body"] = json.loads(req.data.decode("utf-8"))
+            return _FakeHTTPResponse({
+                "model": "vendor/m",
+                "choices": [{"message": {"content": "hola"},
+                            "finish_reason": "stop"}]})
+
+        with mock.patch.object(tf.urllib.request, "urlopen", fake_urlopen):
+            data = rig.chat([{"role": "user", "content": "hi"}], 100, site.temperature)
+        self.assertEqual(data["choices"][0]["message"]["content"], "hola")
+        body = captured["body"]
+        self.assertEqual(body["model"], "vendor/m")
+        self.assertEqual(body["temperature"], 0.42)
+        self.assertEqual(body["top_p"], 0.6)
+        self.assertEqual(body["top_k"], 20)
+        self.assertEqual(body["repeat_penalty"], 1.05)
+        self.assertEqual(body["max_tokens"], 100)
+
+
+class FakeCliRig:
+    """Stands in for Rig at the `cmd_text` call site (patches tf.Rig) so
+    warmup()'s real branches run against scripted rig state -- no network, no
+    live StudioForge rig required. `mode` selects which branch fires."""
+
+    def __init__(self, site, mode="ok", chat_reply="(translated)"):
+        self.site = site
+        self.mode = mode
+        self.chat_reply = chat_reply
+        self.chat_calls = []
+
+    def bench_lease(self):
+        if self.mode == "leased":
+            return {"holder": "crucibleforge", "kind": "benchmark"}
+        return None
+
+    def models(self):
+        if self.mode == "unreachable":
+            raise tf.urllib.error.URLError("connection refused")
+        if self.mode == "missing":
+            return [{"id": "some/other-model"}]
+        return [{"id": self.site.model}]
+
+    def live_parallel(self, model_id):
+        return 2
+
+    def loaded_row(self, model_id):
+        return {"model_id": model_id, "state": "ready", "plan": {"parallel": 2}}
+
+    def wait_ready(self, model_id, timeout_s=900):
+        return self.loaded_row(model_id)
+
+    def pin(self):
+        return "unused-test-pin"
+
+    def unload(self, model_id):
+        raise AssertionError("unload() should not be reached in these tests")
+
+    def load_recommended(self, model_id, ctx_size, priority):
+        raise AssertionError("load_recommended() should not be reached — "
+                              "the fake always reports parallel=2 resident")
+
+    def chat(self, messages, max_tokens, temperature):
+        self.chat_calls.append({"messages": messages, "max_tokens": max_tokens,
+                                "temperature": temperature})
+        return {"choices": [{"message": {"content": self.chat_reply},
+                             "finish_reason": "stop"}]}
+
+
+def _text_args(**kw):
+    base = dict(text=None, to="ja", from_lang="en", model=None, json=False,
+               site=None, no_warmup=False)
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+class TestCmdTextIO(unittest.TestCase):
+    """argument vs stdin, --json shape -- the HTTP layer mocked via a fake
+    Rig patched over tf.Rig, exactly like warmup()'s real branches would see
+    a real rig, so no live StudioForge is required for the suite."""
+
+    def _site(self, **kw):
+        return make_site(model="vendor/m", languages=["ja"], **kw)
+
+    def _run(self, args, site, mode="ok", chat_reply="Ohayo gozaimasu"):
+        sites = {site.name: site}
+        holder = {}
+
+        def make_rig(s):
+            holder["rig"] = FakeCliRig(s, mode=mode, chat_reply=chat_reply)
+            return holder["rig"]
+
+        buf = io.StringIO()
+        with mock.patch.object(tf, "Rig", make_rig):
+            with contextlib.redirect_stdout(buf):
+                rc = tf.cmd_text(args, sites)
+        return rc, buf.getvalue(), holder["rig"]
+
+    def test_translates_the_positional_argument(self):
+        rc, out, rig = self._run(_text_args(text="Good morning"), self._site())
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "Ohayo gozaimasu")
+        self.assertEqual(len(rig.chat_calls), 1)
+        self.assertIn("Good morning", rig.chat_calls[0]["messages"][-1]["content"])
+
+    def test_translates_stdin_when_argument_omitted(self):
+        with mock.patch.object(tf.sys, "stdin", io.StringIO("Good evening\n")):
+            rc, out, rig = self._run(_text_args(text=None), self._site())
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "Ohayo gozaimasu")
+        self.assertIn("Good evening", rig.chat_calls[0]["messages"][-1]["content"])
+
+    def test_json_output_has_exactly_the_four_keys(self):
+        rc, out, _ = self._run(_text_args(text="hi", json=True), self._site())
+        self.assertEqual(rc, 0)
+        data = json.loads(out.strip())
+        self.assertEqual(set(data.keys()), {"from", "to", "model", "text"})
+        self.assertEqual(data, {"from": "en", "to": "ja", "model": "vendor/m",
+                                "text": "Ohayo gozaimasu"})
+
+    def test_plain_output_is_bare_text_not_json(self):
+        rc, out, _ = self._run(_text_args(text="hi"), self._site())
+        self.assertEqual(out.strip(), "Ohayo gozaimasu")
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(out.strip())
+
+    def test_model_override_is_used_and_does_not_mutate_the_shared_site(self):
+        site = self._site()
+        rc, out, rig = self._run(
+            _text_args(text="hi", model="vendor/override", json=True), site)
+        self.assertEqual(rc, 0)
+        data = json.loads(out.strip())
+        self.assertEqual(data["model"], "vendor/override")
+        # the site object living in the `sites` dict must be untouched
+        self.assertEqual(site.model, "vendor/m")
+
+    def test_no_warmup_skips_warmup_entirely(self):
+        site = self._site()
+        sites = {site.name: site}
+
+        class NoWarmupRig(FakeCliRig):
+            def bench_lease(self):
+                raise AssertionError("warmup must be skipped with --no-warmup")
+
+            def models(self):
+                raise AssertionError("warmup must be skipped with --no-warmup")
+
+        buf = io.StringIO()
+        with mock.patch.object(tf, "Rig", lambda s: NoWarmupRig(s)):
+            with contextlib.redirect_stdout(buf):
+                rc = tf.cmd_text(_text_args(text="hi", no_warmup=True), sites)
+        self.assertEqual(rc, 0)
+        self.assertEqual(buf.getvalue().strip(), "(translated)")
+
+
+class TestCmdTextExitCodes(unittest.TestCase):
+    """The exit-code mapping `text` reuses from warmup()/cmd_run: rig leased
+    (crucibleforge doctrine) = 6, model missing on rig = 5, rig unreachable =
+    4, empty input = 2 (usage error), any other warmup/translation failure =
+    1. Every case below is offline -- no live rig, HTTP layer mocked."""
+
+    def _site(self):
+        return make_site(model="vendor/m", languages=["ja"])
+
+    def test_rig_leased_by_a_benchmark_exits_6(self):
+        site = self._site()
+        with mock.patch.object(tf, "Rig", lambda s: FakeCliRig(s, mode="leased")):
+            with self.assertRaises(SystemExit) as cm:
+                tf.cmd_text(_text_args(text="hi"), {site.name: site})
+        self.assertEqual(cm.exception.code, 6)
+
+    def test_model_missing_on_rig_exits_5(self):
+        site = self._site()
+        with mock.patch.object(tf, "Rig", lambda s: FakeCliRig(s, mode="missing")):
+            with self.assertRaises(SystemExit) as cm:
+                tf.cmd_text(_text_args(text="hi"), {site.name: site})
+        self.assertEqual(cm.exception.code, 5)
+
+    def test_rig_unreachable_returns_4(self):
+        site = self._site()
+        with mock.patch.object(tf, "Rig", lambda s: FakeCliRig(s, mode="unreachable")):
+            rc = tf.cmd_text(_text_args(text="hi"), {site.name: site})
+        self.assertEqual(rc, 4)
+
+    def test_rig_http_error_during_warmup_returns_1(self):
+        site = self._site()
+
+        class HTTPBrokenRig(FakeCliRig):
+            def models(self):
+                # HTTPError registers a tempfile finalizer on its fp
+                # regardless of what's passed; close() it here or the GC
+                # prints an unrelated-looking ResourceWarning during
+                # whatever later test happens to collect it.
+                err = tf.urllib.error.HTTPError(
+                    "http://rig.example/v1/models", 500, "boom", None,
+                    io.BytesIO(b""))
+                err.close()
+                raise err
+
+        with mock.patch.object(tf, "Rig", lambda s: HTTPBrokenRig(s)):
+            rc = tf.cmd_text(_text_args(text="hi"), {site.name: site})
+        self.assertEqual(rc, 1)
+
+    def test_warmup_runtime_error_returns_1(self):
+        site = self._site()
+
+        class BrokenRig(FakeCliRig):
+            def models(self):
+                raise RuntimeError("boom")
+
+        with mock.patch.object(tf, "Rig", lambda s: BrokenRig(s)):
+            rc = tf.cmd_text(_text_args(text="hi"), {site.name: site})
+        self.assertEqual(rc, 1)
+
+    def test_translation_failure_returns_1(self):
+        site = self._site()
+
+        class EmptyReplyRig(FakeCliRig):
+            def chat(self, messages, max_tokens, temperature):
+                return {"choices": [{"message": {"content": ""},
+                                     "finish_reason": "stop"}]}
+
+        with mock.patch.object(tf, "Rig", lambda s: EmptyReplyRig(s)):
+            rc = tf.cmd_text(_text_args(text="hi"), {site.name: site})
+        self.assertEqual(rc, 1)
+
+    def test_empty_positional_argument_exits_2(self):
+        site = self._site()
+        with self.assertRaises(SystemExit) as cm:
+            tf.cmd_text(_text_args(text=""), {site.name: site})
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_whitespace_only_stdin_exits_2(self):
+        site = self._site()
+        with mock.patch.object(tf.sys, "stdin", io.StringIO("   \n\t \n")):
+            with self.assertRaises(SystemExit) as cm:
+                tf.cmd_text(_text_args(text=None), {site.name: site})
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_completely_empty_stdin_exits_2(self):
+        site = self._site()
+        with mock.patch.object(tf.sys, "stdin", io.StringIO("")):
+            with self.assertRaises(SystemExit) as cm:
+                tf.cmd_text(_text_args(text=None), {site.name: site})
+        self.assertEqual(cm.exception.code, 2)
+
+
+class TestTextCliWiring(unittest.TestCase):
+    """The argparse wiring in main(): --help exits before load_config() is
+    ever reached, so this needs no ~/.config/transforge/config.toml."""
+
+    def test_help_says_plain_text_only_no_structure_rules(self):
+        with mock.patch.object(tf.sys, "argv", ["transforge", "text", "--help"]):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                with self.assertRaises(SystemExit) as cm:
+                    tf.main()
+        self.assertEqual(cm.exception.code, 0)
+        help_text = buf.getvalue()
+        self.assertIn("PLAIN TEXT", help_text)
+        self.assertIn("--to", help_text)
+        self.assertIn("--from", help_text)
+        self.assertIn("--json", help_text)
+
+    def test_to_is_required(self):
+        with mock.patch.object(tf.sys, "argv", ["transforge", "text", "hi"]):
+            with self.assertRaises(SystemExit) as cm:
+                tf.main()
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_top_level_help_lists_text_subcommand(self):
+        with mock.patch.object(tf.sys, "argv", ["transforge", "--help"]):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                with self.assertRaises(SystemExit) as cm:
+                    tf.main()
+        self.assertEqual(cm.exception.code, 0)
+        self.assertIn("text", buf.getvalue())

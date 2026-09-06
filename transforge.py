@@ -18,6 +18,9 @@ Commands:
   run      [--site X] [--langs ..] [--files ..] [--force] [--dry-run]
            [--workers N] [--no-warmup] [--limit N]
   single   FILE --lang L [--out PATH]      translate one arbitrary page
+  text     [TEXT] --to LANG [--from LANG]  translate stdin/arg as PLAIN TEXT
+           [--model ID] [--json]           (no frontmatter/HTML rules; a
+                                            pasted paragraph or chat export)
   accept   [--site X] [--files ..|--all]   record existing siblings as current
   verify   [--site X]                      re-run structural checks on outputs
   warmup   [--site X]                      ensure the model is loaded well
@@ -35,6 +38,7 @@ if sys.version_info < (3, 11):
 
 import argparse
 import concurrent.futures
+import copy
 import datetime as _dt
 import hashlib
 import json
@@ -676,6 +680,68 @@ class Translator:
         merged.update({k: translated[k] for k in keys})
         return yaml.safe_dump(merged, allow_unicode=True, sort_keys=False,
                               default_flow_style=False).strip()
+
+    # ---- plain text (`transforge text`: a pasted paragraph or chat export,
+    # not a site page -- no frontmatter, no HTML/structure contract)
+    def text_prompt(self, to_lang, from_lang=None):
+        """Prompt for translate_text(), branching on prompt_template exactly
+        like body_prompt()/translate_frontmatter() do: a pure-MT model (Hy-MT2)
+        wants one terse instruction line (same style as _mt_text's frontmatter
+        prompt), while an instruct model takes a fuller translator framing.
+        Neither branch mentions HTML/JSON -- this path never carries either."""
+        s = self.site
+        to_name = s.lang_name(to_lang)
+        # "en"/"english" (the CLI's own --from default) is the implicit source
+        # every other prompt in this file already assumes -- only an EXPLICIT
+        # non-English source earns its own "from X" clause.
+        explicit_from = bool(from_lang) and from_lang.strip().lower() not in (
+            "en", "english")
+        from_name = s.lang_name(from_lang) if explicit_from else None
+        if s.prompt_template == "hunyuan-mt":
+            p = (f"Translate the following segment from {from_name} into "
+                 f"{to_name}, without additional explanation." if from_name
+                 else f"Translate the following segment into {to_name}, "
+                      "without additional explanation.")
+            if self._terms():
+                p += f" Keep these terms in English: {self._terms()}."
+            if self._style(to_lang):
+                p += f" {self._style(to_lang)}"
+            return p
+        p = ("You are a professional translator. Translate the following "
+             f"plain text from {from_name} into {to_name}, naturally and "
+             "fluently.\n" if from_name else
+             "You are a professional translator. Translate the following "
+             f"plain text into {to_name}, naturally and fluently.\n")
+        if s.site_description:
+            p += f"Context: {s.site_description}\n"
+        if self._terms():
+            p += (f"Keep these brand names, product names, commands, file "
+                  f"paths and identifiers in English: {self._terms()}.\n")
+        if self._style(to_lang):
+            p += f"Language conventions: {self._style(to_lang)}\n"
+        p += ("Output ONLY the translation, preserving paragraph breaks. No "
+              "markdown fences, no commentary, no notes.")
+        return p
+
+    def translate_text(self, text, to_lang, from_lang=None):
+        """Plain-text translation for `transforge text`: the SAME
+        request-building path as everywhere else in this class (rig.chat, so
+        config temperature/extra_params/disable_thinking all apply; the
+        prompt_template branch above; the length-then-retry pattern used by
+        _mt_text/translate_frontmatter) sized for arbitrary pasted text rather
+        than a short frontmatter field, so it spends the BODY token budget."""
+        s = self.site
+        prompt = self.text_prompt(to_lang, from_lang) + "\n\n" + text
+        messages = [{"role": "user", "content": prompt}]
+        data = self.rig.chat(messages, s.max_tokens_body, s.temperature)
+        choice = data["choices"][0]
+        out = choice["message"]["content"].strip()
+        if choice.get("finish_reason") == "length" or not out:
+            data = self.rig.chat(messages, s.max_tokens_body_retry, s.temperature)
+            out = data["choices"][0]["message"]["content"].strip()
+        if not out:
+            raise RuntimeError("empty text translation")
+        return out
 
     # ---- body
     def split_chunks(self, body):
@@ -1364,6 +1430,49 @@ def cmd_single(args, sites):
     return 0
 
 
+def cmd_text(args, sites):
+    """`transforge text` -- translate stdin or an argument as plain text (a
+    pasted paragraph, a chat export, a snippet): the same warmup/lease-check/
+    sampling path as every other command, none of the frontmatter/HTML
+    structure machinery (there is no structure to preserve in plain text)."""
+    site = pick_site(sites, args.site)
+    if args.model:
+        site = copy.copy(site)
+        site.model = args.model
+    text = args.text if args.text is not None else sys.stdin.read()
+    if not text.strip():
+        die("no text given (pass TEXT or pipe it on stdin)")
+
+    rig = Rig(site)
+    try:
+        if not args.no_warmup:
+            warmup(site, rig, quiet=True)
+    except urllib.error.HTTPError as e:
+        # reachable, but the server refused: not an unreachable-rig condition
+        print(f"rig returned HTTP {e.code} {e.reason} for {e.url}", file=sys.stderr)
+        return 1
+    except (urllib.error.URLError, OSError) as e:
+        print(f"rig unreachable: {e}", file=sys.stderr)
+        return 4
+    except RuntimeError as e:
+        print(f"warmup failed: {e}", file=sys.stderr)
+        return 1
+
+    tr = Translator(site, rig)
+    try:
+        out = tr.translate_text(text, args.to, args.from_lang)
+    except RuntimeError as e:
+        print(f"translation failed: {e}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps({"from": args.from_lang, "to": args.to,
+                          "model": site.model, "text": out}))
+    else:
+        print(out)
+    return 0
+
+
 def cmd_warmup(args, sites):
     site = pick_site(sites, args.site)
     rig = Rig(site)
@@ -1471,6 +1580,27 @@ def main():
     p.add_argument("file"); p.add_argument("--lang", required=True)
     p.add_argument("--out"); p.add_argument("--site")
     p.add_argument("--no-warmup", action="store_true")
+    p = sub.add_parser(
+        "text",
+        help="translate a pasted paragraph or chat export as plain text",
+        description="Translate TEXT (or stdin, if TEXT is omitted) as PLAIN "
+                     "TEXT: a pasted paragraph, a chat export, a snippet -- "
+                     "not a site page. Frontmatter/HTML structure rules do "
+                     "NOT apply here; the request uses the same warmup, "
+                     "lease check and sampling settings (temperature, "
+                     "prompt_template, extra_params) as every other command.")
+    p.add_argument("text", nargs="?", metavar="TEXT",
+                   help="text to translate; omitted means read stdin")
+    p.add_argument("--to", required=True, metavar="LANG",
+                   help="target language code (e.g. ja, es, fr)")
+    p.add_argument("--from", dest="from_lang", default="en", metavar="LANG",
+                   help="source language code (default: en)")
+    p.add_argument("--model", metavar="ID",
+                   help="override the configured model for this call only")
+    p.add_argument("--json", action="store_true",
+                   help='emit {"from","to","model","text"} instead of plain stdout')
+    p.add_argument("--site")
+    p.add_argument("--no-warmup", action="store_true")
     p = sub.add_parser("accept"); common(p, files=True)
     p.add_argument("--all", action="store_true")
     p = sub.add_parser("verify"); common(p, langs=False)
@@ -1487,9 +1617,10 @@ def main():
     args = ap.parse_args()
     _, sites = load_config()
     fn = {"status": cmd_status, "plan": cmd_plan, "run": cmd_run,
-          "single": cmd_single, "accept": cmd_accept, "verify": cmd_verify,
-          "warmup": cmd_warmup, "models": cmd_models, "report": cmd_report,
-          "config": cmd_config, "review": _review.cmd_review}[args.cmd]
+          "single": cmd_single, "text": cmd_text, "accept": cmd_accept,
+          "verify": cmd_verify, "warmup": cmd_warmup, "models": cmd_models,
+          "report": cmd_report, "config": cmd_config,
+          "review": _review.cmd_review}[args.cmd]
     sys.exit(fn(args, sites))
 
 
