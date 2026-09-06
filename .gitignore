@@ -3,3 +3,6 @@ __pycache__/
 *.tmp
 .venv/
 .ruff_cache/
+# scrub_check.py's own personal-identifier rules (house rule #25) -- must
+# never be committed, or the words that must not be published are published.
+scripts/scrub-rules.local.txt
