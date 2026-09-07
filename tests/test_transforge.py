@@ -526,6 +526,67 @@ class TestGlossaryDeltas(unittest.TestCase):
         self.assertEqual(inj, [])
 
 
+# ---------------------------------------------- glossary prompt scoping
+class TestGlossaryPromptScoping(unittest.TestCase):
+    """The 2026-09-07 fix: no_translate is site-wide, but a segment's prompt
+    must only carry the terms that ACTUALLY OCCUR in that segment's own
+    source text -- sending the whole list regardless of relevance is what let
+    Hy-MT2 (a pure-MT model) invent "OpenClaw" in German prose for a page
+    that never mentions it (glossary_deltas caught it: 0 -> 1). Scoping the
+    prompt removes the temptation instead of only detecting it after the
+    fact."""
+
+    def setUp(self):
+        self.site = make_site(no_translate=["OpenClaw", "CrucibleForge", "DisPatch"])
+        self.tr = tf.Translator(self.site, rig=None)
+
+    def test_terms_for_only_returns_terms_present_in_text(self):
+        text = "CrucibleForge benchmarks local models."
+        terms = self.tr._terms_for(text)
+        self.assertIn("CrucibleForge", terms)
+        self.assertNotIn("OpenClaw", terms)
+        self.assertNotIn("DisPatch", terms)
+
+    def test_terms_for_empty_when_no_terms_present(self):
+        self.assertEqual(self.tr._terms_for("just plain prose, no brands here"), "")
+
+    def test_terms_for_empty_for_empty_text(self):
+        self.assertEqual(self.tr._terms_for(""), "")
+        self.assertEqual(self.tr._terms_for(None), "")
+
+    def test_body_prompt_hunyuan_omits_absent_terms(self):
+        site = make_site(prompt_template="hunyuan-mt", no_translate=["OpenClaw"],
+                         lang_names={"de": "German"})
+        tr = tf.Translator(site, rig=None)
+        chunk = "<p>CrucibleForge is a benchmark tool.</p>"
+        p = tr.body_prompt("de", chunk)
+        self.assertNotIn("OpenClaw", p)
+
+    def test_body_prompt_instruct_includes_only_present_terms(self):
+        site = make_site(prompt_template="instruct",
+                         no_translate=["OpenClaw", "CrucibleForge"],
+                         lang_names={"de": "German"})
+        tr = tf.Translator(site, rig=None)
+        chunk = "<p>CrucibleForge is a benchmark tool.</p>"
+        p = tr.body_prompt("de", chunk)
+        self.assertIn("CrucibleForge", p)
+        self.assertNotIn("OpenClaw", p)
+
+    def test_fm_prompt_omits_absent_terms(self):
+        site = make_site(prompt_template="instruct", no_translate=["OpenClaw"],
+                         lang_names={"de": "German"})
+        tr = tf.Translator(site, rig=None)
+        p = tr.fm_prompt(["title"], "de", "title: A CrucibleForge deep dive")
+        self.assertNotIn("OpenClaw", p)
+
+    def test_text_prompt_omits_absent_terms(self):
+        site = make_site(prompt_template="hunyuan-mt", no_translate=["OpenClaw"],
+                         lang_names={"de": "German"})
+        tr = tf.Translator(site, rig=None)
+        p = tr.text_prompt("de", "CrucibleForge runs benchmarks.")
+        self.assertNotIn("OpenClaw", p)
+
+
 # ------------------------------------------------------------- exit codes
 class TestUsageExitCodes(unittest.TestCase):
     """Usage/config errors must exit 2, not the bare sys.exit(str) default 1."""
@@ -1085,7 +1146,7 @@ class TestTranslateTextPrompt(unittest.TestCase):
         site = make_site(prompt_template="hunyuan-mt",
                          lang_names={"ja": "Japanese"})
         tr = tf.Translator(site, rig=None)
-        p = tr.text_prompt("ja")
+        p = tr.text_prompt("ja", "Good morning")
         self.assertIn("into Japanese", p)
         self.assertNotIn("from ", p)
 
@@ -1093,7 +1154,7 @@ class TestTranslateTextPrompt(unittest.TestCase):
         site = make_site(prompt_template="hunyuan-mt",
                          lang_names={"ja": "Japanese", "es": "Spanish"})
         tr = tf.Translator(site, rig=None)
-        p = tr.text_prompt("ja", from_lang="es")
+        p = tr.text_prompt("ja", "Buenos dias", from_lang="es")
         self.assertIn("from Spanish into Japanese", p)
 
     def test_default_from_en_does_not_produce_a_from_clause(self):
@@ -1104,14 +1165,14 @@ class TestTranslateTextPrompt(unittest.TestCase):
         site = make_site(prompt_template="hunyuan-mt",
                          lang_names={"ja": "Japanese"})
         tr = tf.Translator(site, rig=None)
-        p = tr.text_prompt("ja", from_lang="en")
+        p = tr.text_prompt("ja", "Good morning", from_lang="en")
         self.assertNotIn("from ", p)
         self.assertNotIn(" en ", p)
 
     def test_instruct_prompt_is_conversational_and_has_no_html_rules(self):
         site = make_site(prompt_template="instruct", lang_names={"ja": "Japanese"})
         tr = tf.Translator(site, rig=None)
-        p = tr.text_prompt("ja")
+        p = tr.text_prompt("ja", "Good morning")
         self.assertIn("professional translator", p)
         self.assertIn("plain text", p)
         for html_marker in ("<code>", "<pre>", "HTML", "JSON", "tag"):
@@ -1122,7 +1183,7 @@ class TestTranslateTextPrompt(unittest.TestCase):
             site = make_site(prompt_template=template, lang_names={"ja": "Japanese"},
                              no_translate=["OpenClaw"], style={"ja": "polite desu/masu"})
             tr = tf.Translator(site, rig=None)
-            p = tr.text_prompt("ja")
+            p = tr.text_prompt("ja", "Ask OpenClaw for help")
             self.assertIn("OpenClaw", p, template)
             self.assertIn("polite desu/masu", p, template)
 

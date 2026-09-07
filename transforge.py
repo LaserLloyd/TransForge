@@ -60,11 +60,15 @@ STATE_DIR = os.path.expanduser("~/.local/state/transforge")
 # the environment variable takes precedence and is the portable way to set it.
 PIN_ENV_FILE = os.path.expanduser("~/.openclaw/gateway.systemd.env")
 
-# lease holders whose runs must not be disturbed (CrucibleForge doctrine)
+# lease holders whose runs must not be disturbed (CrucibleForge doctrine).
+# FALLBACK ONLY since StudioForge 1.26-09-04: every lease record now carries
+# `holder_family` + `kind` and _is_bench_lease() prefers those; the prefix
+# hack runs only for a record that has neither key (an older server).
 BENCH_LEASE_HOLDERS = ("crucibleforge", "gauntlet")
 
 def _is_bench_holder(holder: str) -> bool:
-    """True for any CrucibleForge lease, including its phase-suffixed ones.
+    """FALLBACK: True for any CrucibleForge lease, including its phase-suffixed
+    ones, by holder-string prefix.
 
     Exact membership was a hole: the benchmark leases the run as
     "crucibleforge" but the JUDGE phase as **"crucibleforge-judge"**
@@ -76,7 +80,67 @@ def _is_bench_holder(holder: str) -> bool:
     return h in BENCH_LEASE_HOLDERS or h.split("-", 1)[0] in BENCH_LEASE_HOLDERS
 
 
+def _is_bench_lease(lease) -> bool:
+    """True when a lease RECORD belongs to a benchmark.
+
+    Prefers the rig's own classification (StudioForge A4, 2026-09-04): `kind ==
+    "benchmark"`, or a `holder_family` in BENCH_LEASE_HOLDERS -- the server
+    derives both from the holder with one family rule, so `crucibleforge-judge`
+    arrives as family `crucibleforge` / kind `benchmark`. A record with neither
+    key falls back to _is_bench_holder(); a present `kind: "render"` is believed.
+    """
+    if not isinstance(lease, dict):
+        return False
+    kind = str(lease.get("kind") or "").strip().lower()
+    family = str(lease.get("holder_family") or "").strip().lower()
+    if kind or family:
+        return kind == "benchmark" or family in BENCH_LEASE_HOLDERS
+    return _is_bench_holder(lease.get("holder", ""))
+
+
 USAGE_ERROR = 2
+
+# StudioForge's per-client attribution header (`/api/status.clients`). One
+# distinct value per tool on the box; without it every caller is one bare-IP row.
+SF_CLIENT = "transforge"
+
+
+class RigLeased(RuntimeError):
+    """A 507 `gpu_leased` from StudioForge: the card this request needs is
+    inside somebody else's lease. Carries the lease so the caller can tell a
+    benchmark (stand down, exit 6) from anything else (back off)."""
+    def __init__(self, msg, lease=None, retry_after_s=None):
+        super().__init__(msg)
+        self.lease = lease if isinstance(lease, dict) else {}
+        self.retry_after_s = retry_after_s
+
+
+def sf_error(e):
+    """(code, retry_after_s, lease, body) from a StudioForge HTTPError.
+
+    Since 1.26-09-04 every refusal carries `error.code` (`gpu_leased`,
+    `insufficient_vram`, `allowed_devices_unavailable`, `priority_hold`,
+    `context_exceeded`, ...) plus `error.studioforge.{retry_after_s, lease}`
+    and a `Retry-After` header. Branching on the bare HTTP status treated all
+    three 507 conditions alike -- one of which is "wait", one "it will never
+    fit", one "fix the call". Body is read once here; HTTPError.read() is not
+    re-readable."""
+    body = e.read().decode("utf-8", "replace")[:600]
+    code, retry, lease = None, None, None
+    try:
+        err = json.loads(body).get("error") or {}
+        code = err.get("code")
+        sf = err.get("studioforge") or {}
+        lease = sf.get("lease") if isinstance(sf.get("lease"), dict) else None
+        retry = (err.get("retry_after_s") or sf.get("retry_after_s"))
+    except Exception:
+        pass
+    if retry is None:
+        try:
+            retry = float(e.headers.get("Retry-After") or 0) or None
+        except (TypeError, ValueError, AttributeError):
+            retry = None
+    return code, retry, lease, body
 
 
 def die(msg, code=USAGE_ERROR):
@@ -313,7 +377,7 @@ class Rig:
         self._pin = None
 
     def _req(self, method, path, body=None, pin=False, timeout=30):
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", "X-SF-Client": SF_CLIENT}
         if pin:
             p = self.pin()
             if not p:
@@ -359,7 +423,7 @@ class Rig:
 
     def bench_lease(self):
         for l in self.leases():
-            if _is_bench_holder(l.get("holder", "")):
+            if _is_bench_lease(l):
                 return l
         return None
 
@@ -398,6 +462,13 @@ class Rig:
     def chat(self, messages, max_tokens, temperature):
         payload = {"model": self.site.model, "messages": messages,
                    "max_tokens": max_tokens, "temperature": temperature}
+        # Admission tier for THIS request (D48: 1 chat / 2 agent / 3
+        # background; anything else is a 400). The load was already tiered via
+        # load-recommended; without this key every request competed at default
+        # admission, which for the rig's largest background consumer defeated
+        # the point of priority 3.
+        if self.site.priority in (1, 2, 3):
+            payload["priority"] = int(self.site.priority)
         if self.site.disable_thinking:
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         payload.update(self.site.extra_params or {})
@@ -416,10 +487,19 @@ class Rig:
                                         msg.get("content") or "", flags=re.DOTALL).strip()
                 return data
             except urllib.error.HTTPError as e:
-                body = e.read()[:300]
-                last_err = f"HTTP {e.code}: {body!r}"
+                code, retry, lease, body = sf_error(e)
+                last_err = f"HTTP {e.code} [{code or '-'}]: {body[:300]!r}"
+                if code == "gpu_leased":
+                    # Somebody's lease covers the card: not a retry, a hand-off
+                    # to the lease gate (benchmark => the run stands down).
+                    raise RigLeased(last_err, lease, retry)
+                if code in ("insufficient_vram", "allowed_devices_unavailable",
+                            "context_exceeded", "model_not_found"):
+                    raise RuntimeError(last_err)     # retrying cannot change it
                 if e.code in (429, 500, 502, 503, 504) and attempt < 2:
-                    time.sleep(6 * (attempt + 1))
+                    # priority_hold / busy: the rig says how long, capped so a
+                    # worker never sleeps through the whole run.
+                    time.sleep(min(float(retry), 60.0) if retry else 6 * (attempt + 1))
                     continue
                 raise RuntimeError(last_err)
             except RuntimeError:
@@ -479,19 +559,25 @@ def warmup(site, rig, quiet=False):
             rig.load_recommended(site.model, site.ctx_per_slot, site.priority)
             break
         except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", "replace")[:400]
-            retry = None
-            try:
-                err = json.loads(body)
-                retry = (err.get("retry_after_s")
-                         or (err.get("error") or {}).get("retry_after_s")
-                         or ((err.get("error") or {}).get("studioforge") or {}).get("retry_after_s"))
-            except Exception:
-                pass
+            code, retry, lease, body = sf_error(e)
+            if code == "gpu_leased":
+                # A benchmark lease means stand down (exit 6, same as the
+                # lease gate above); any other holder is waited for by
+                # retry_after_s, never poked blindly.
+                if _is_bench_lease(lease or {}):
+                    print(f"rig leased by '{(lease or {}).get('holder')}' "
+                          f"[{(lease or {}).get('kind')}] — backing off", file=sys.stderr)
+                    sys.exit(6)
+                if attempt < 5:
+                    time.sleep(max(2.0, min(float(retry or 60), 60.0)))
+                    continue
+                raise RuntimeError(f"load failed: HTTP {e.code} [{code}]: {body}")
+            if code in ("insufficient_vram", "allowed_devices_unavailable"):
+                raise RuntimeError(f"load failed: HTTP {e.code} [{code}]: {body}")
             if e.code in (503, 507) and retry and attempt < 5:
                 time.sleep(max(2.0, min(float(retry), 60.0)))
                 continue
-            raise RuntimeError(f"load failed: HTTP {e.code}: {body}")
+            raise RuntimeError(f"load failed: HTTP {e.code} [{code or '-'}]: {body}")
     rig.wait_ready(site.model)
     return workers_for(site, rig)
 
@@ -510,13 +596,25 @@ class Translator:
         self.rig = rig
 
     # ---- prompts
-    def _terms(self):
-        return ", ".join(self.site.no_translate) if self.site.no_translate else ""
+    def _terms_for(self, text):
+        """Glossary terms to hand the model for THIS segment only -- scoped to
+        the ones that actually occur in `text` (same word-boundary matcher
+        verify_structure uses to police the output, see _term_re below).
+        Sending the WHOLE no_translate list on every call, regardless of
+        whether a term appears on the page, is what let Hy-MT2 (a pure-MT
+        model that treats every context token as material) invent "OpenClaw"
+        in German prose for a page that never mentions it -- confirmed 2026-09-07
+        via glossary_deltas() on the failing run (0 -> 1). Scoping to
+        page-actual terms removes the temptation and shrinks the prompt."""
+        if not self.site.no_translate or not text:
+            return ""
+        terms = [t for t in self.site.no_translate if _term_re(t).search(text)]
+        return ", ".join(terms) if terms else ""
 
     def _style(self, lang):
         return self.site.style.get(lang, "")
 
-    def fm_prompt(self, keys, lang):
+    def fm_prompt(self, keys, lang, source_text):
         s = self.site
         p = (f"You translate the YAML frontmatter of a web page from English into "
              f"{s.lang_name(lang)}.\n")
@@ -527,9 +625,10 @@ class Translator:
               "- Scalar fields: natural, fluent translation.\n"
               "- Array fields: translate every string, keep the SAME number of "
               "items in the SAME order.\n")
-        if self._terms():
+        terms = self._terms_for(source_text)
+        if terms:
             p += (f"- Keep these brand/technical terms exactly as written: "
-                  f"{self._terms()}. Also keep code fragments, file paths and "
+                  f"{terms}. Also keep code fragments, file paths and "
                   "commands as-is.\n")
         if self._style(lang):
             p += f"- Language conventions: {self._style(lang)}\n"
@@ -538,7 +637,7 @@ class Translator:
               "keys. No markdown fences, no commentary.")
         return p
 
-    def body_prompt(self, lang):
+    def body_prompt(self, lang, source_text):
         s = self.site
         name = s.lang_name(lang)
         if s.prompt_template == "hunyuan-mt":
@@ -546,8 +645,9 @@ class Translator:
                  "explanation. The segment is HTML: translate only human-readable "
                  "text; copy every tag, attribute, URL, path and all code inside "
                  "<code>/<pre> exactly as-is.")
-            if self._terms():
-                p += f" Keep these terms in English: {self._terms()}."
+            terms = self._terms_for(source_text)
+            if terms:
+                p += f" Keep these terms in English: {terms}."
             if self._style(lang):
                 p += f" {self._style(lang)}"
             return p
@@ -568,9 +668,10 @@ class Translator:
             "font-size, d, etc.).\n"
             "3. Copy ALL content inside <code>...</code> and <pre><code>...</code>"
             "</pre> byte-for-byte, untranslated.\n")
-        if self._terms():
+        terms = self._terms_for(source_text)
+        if terms:
             p += (f"4. Keep brand names, product names, commands, file paths and "
-                  f"identifiers in English: {self._terms()}.\n")
+                  f"identifiers in English: {terms}.\n")
         p += (
             "5. Preserve blank lines between blocks and the section order. Keep "
             "the same number of headings, SVG blocks, tables, figures, images and "
@@ -592,8 +693,9 @@ class Translator:
         s = self.site
         prompt = (f"Translate the following segment into {s.lang_name(lang)}, "
                   "without additional explanation.")
-        if self._terms():
-            prompt += (f" Keep these terms exactly as written: {self._terms()}. "
+        terms = self._terms_for(text)
+        if terms:
+            prompt += (f" Keep these terms exactly as written: {terms}. "
                        "Keep code fragments, file paths and commands as-is.")
         if self._style(lang):
             prompt += f" {self._style(lang)}"
@@ -634,7 +736,7 @@ class Translator:
             merged.update(translated)
             return yaml.safe_dump(merged, allow_unicode=True, sort_keys=False,
                                   default_flow_style=False).strip()
-        sys_prompt = self.fm_prompt(keys, lang)
+        sys_prompt = self.fm_prompt(keys, lang, fm_text)
         messages = [{"role": "system", "content": sys_prompt},
                     {"role": "user", "content": fm_text}]
         data = self.rig.chat(messages, s.max_tokens_fm, s.temperature)
@@ -683,7 +785,7 @@ class Translator:
 
     # ---- plain text (`transforge text`: a pasted paragraph or chat export,
     # not a site page -- no frontmatter, no HTML/structure contract)
-    def text_prompt(self, to_lang, from_lang=None):
+    def text_prompt(self, to_lang, source_text, from_lang=None):
         """Prompt for translate_text(), branching on prompt_template exactly
         like body_prompt()/translate_frontmatter() do: a pure-MT model (Hy-MT2)
         wants one terse instruction line (same style as _mt_text's frontmatter
@@ -702,8 +804,9 @@ class Translator:
                  f"{to_name}, without additional explanation." if from_name
                  else f"Translate the following segment into {to_name}, "
                       "without additional explanation.")
-            if self._terms():
-                p += f" Keep these terms in English: {self._terms()}."
+            terms = self._terms_for(source_text)
+            if terms:
+                p += f" Keep these terms in English: {terms}."
             if self._style(to_lang):
                 p += f" {self._style(to_lang)}"
             return p
@@ -714,9 +817,10 @@ class Translator:
              f"plain text into {to_name}, naturally and fluently.\n")
         if s.site_description:
             p += f"Context: {s.site_description}\n"
-        if self._terms():
+        terms = self._terms_for(source_text)
+        if terms:
             p += (f"Keep these brand names, product names, commands, file "
-                  f"paths and identifiers in English: {self._terms()}.\n")
+                  f"paths and identifiers in English: {terms}.\n")
         if self._style(to_lang):
             p += f"Language conventions: {self._style(to_lang)}\n"
         p += ("Output ONLY the translation, preserving paragraph breaks. No "
@@ -731,7 +835,7 @@ class Translator:
         _mt_text/translate_frontmatter) sized for arbitrary pasted text rather
         than a short frontmatter field, so it spends the BODY token budget."""
         s = self.site
-        prompt = self.text_prompt(to_lang, from_lang) + "\n\n" + text
+        prompt = self.text_prompt(to_lang, text, from_lang) + "\n\n" + text
         messages = [{"role": "user", "content": prompt}]
         data = self.rig.chat(messages, s.max_tokens_body, s.temperature)
         choice = data["choices"][0]
@@ -798,7 +902,7 @@ class Translator:
         s = self.site
         budget = s.max_tokens_body
         masked, spans = mask_code_spans(chunk)
-        messages = [{"role": "system", "content": self.body_prompt(lang)},
+        messages = [{"role": "system", "content": self.body_prompt(lang, chunk)},
                     {"role": "user", "content": masked}]
         deltas = []
         for attempt in range(3):
@@ -1275,6 +1379,16 @@ def cmd_run(args, sites):
                 print(f"WARN [{state:>16}] {lang} {rel_src}: glossary terms used "
                       "more often than the source (spot-check for bleed): "
                       + ", ".join(increased), file=sys.stderr)
+        except RigLeased as e:
+            # A mid-run lease refusal is the lease gate firing late: defer the
+            # page (not a failure), stop starting new ones, exit 6.
+            with lock:
+                results["leased"] += 1
+                lease_state["stop"] = True
+                lease_state["holder"] = e.lease.get("holder") or "?"
+            print(f"SKIP [{state:>16}] {lang} {rel_src}: rig leased by "
+                  f"'{e.lease.get('holder') or '?'}' [{e.lease.get('kind') or '?'}] "
+                  f"— backing off", file=sys.stderr)
         except Exception as e:
             with lock:
                 results["fail"] += 1
