@@ -1,23 +1,54 @@
 # TransForge
 
-Config-driven website translator that runs entirely against your own
-StudioForge/llama.cpp LLM server (e.g. `http://localhost:1234`). No cloud API,
-no per-word cost.
+Config-driven website translator that runs entirely on your own local LLM server — no cloud APIs, no per-word cost. Content-hash manifests translate only what changed, structural verification catches broken output, writes are atomic, and hand-edited translations are never overwritten.
 
-It discovers English source pages in a site tree, decides which language
-siblings are missing or stale using a **content-hash manifest** (never mtimes),
+It talks to a StudioForge/llama.cpp server (e.g. `http://localhost:1234`),
+discovers English source pages in a site tree, decides which language siblings
+are missing or stale using a **content-hash manifest** (never mtimes),
 translates only those, verifies the output structurally, and writes siblings
 atomically. A hand-edited sibling is never overwritten without `--force`.
 
-Single file: `transforge.py` (installed as `~/.local/bin/transforge`).
-Requires Python 3.11+ (`tomllib`) and PyYAML.
+Two files: `transforge.py` (the CLI) and `review.py` (the optional review
+stage, loaded from the same directory). Requires Python 3.11+ (`tomllib`) and
+PyYAML.
+
+```bash
+git clone https://github.com/LaserLloyd/TransForge   # scrub-ok: public repo URL
+cd TransForge
+pip install .        # puts `transforge` on your PATH
+```
+
+Or run it in place by symlinking `transforge.py` onto your PATH; `review.py` is
+found next to the symlink's target.
 
 - Config: `~/.config/transforge/config.toml`
 - State: `~/.local/state/transforge/` — `<site>-manifest.json`, `backups/<site>/<stamp>/`
 
 Sibling naming: `content/projects/foo.md` → `content/projects/foo.ja.md`.
 
+A source page whose frontmatter sets `en_only: true` or `translate: false` is
+skipped by discovery: no sibling is made and the page never shows up in
+`status`, `plan` or `run`. Use it for pages whose prose lives in a template
+rather than in the markdown body.
+
 ## Config reference
+
+A minimal config:
+
+```toml
+[defaults]
+endpoint = "http://localhost:1234"
+model = "publisher/repo/file-stem"
+
+[sites.example]
+root = "~/sites/example"
+content_dirs = ["content/projects", "content/pages"]
+languages = ["ja", "de"]
+lang_names = { ja = "Japanese", de = "German" }
+link_dirs = ["projects"]
+no_translate = ["TransForge"]
+translate_fields = ["title", "excerpt"]
+```
 
 `[defaults]` applies to every site; any key may be repeated inside
 `[sites.<name>]` to override it for that site only.
@@ -92,6 +123,8 @@ transforge plan   [--site X] [--langs ..] [--files ..] [--force]
 transforge run    [--site X] [--langs ..] [--files ..] [--force] [--dry-run]
                   [--workers N] [--no-warmup] [--limit N]
 transforge single FILE --lang L [--out PATH] [--site X] [--no-warmup]
+transforge text   [TEXT] --to LANG [--from LANG] [--model ID] [--json]
+                  [--site X] [--no-warmup]     plain text from TEXT or stdin
 transforge accept [--site X] [--langs ..] [--files ..] [--all]
 transforge verify [--site X]                  re-run structural checks on outputs
 transforge warmup [--site X]                  load the model on a sane plan
@@ -108,15 +141,16 @@ Examples:
 
 ```bash
 transforge status --all
-transforge plan --site laserlloyd --langs ja zh
-transforge run --site laserlloyd --langs ja --limit 3
-transforge run --site laserlloyd --dry-run
-transforge run --site laserlloyd --files content/projects/foo.md --langs ja --force
+transforge plan --site example --langs ja zh
+transforge run --site example --langs ja --limit 3
+transforge run --site example --dry-run
+transforge run --site example --files content/projects/foo.md --langs ja --force
 transforge single ~/notes/page.md --lang de --out /tmp/page.de.md
-transforge accept --site laserlloyd --all
-transforge verify --site laserlloyd
+echo "Thanks for reading." | transforge text --to ja
+transforge accept --site example --all
+transforge verify --site example
 transforge report --append ~/reports/translations.md
-transforge review --site laserlloyd --dry-run
+transforge review --site example --dry-run
 ```
 
 ## Switching models
@@ -137,11 +171,13 @@ Re-run them deliberately with `--force --files ...`, or leave them.
 
 ## Warmup, concurrency, leases
 
-`warmup` (run automatically by `run` and `single` unless `--no-warmup`) does:
+`warmup` (run automatically by `run`, `single` and `text` unless `--no-warmup`) does:
 
-1. Check `/api/leases`. If a lease is held by `crucibleforge` or `gauntlet`, it
-   prints the holder and exits **6** without touching the rig — benchmark runs
-   are never disturbed.
+1. Check `/api/leases`. If a benchmark holds a lease (the server marks it
+   `kind = "benchmark"` or `holder_family` `crucibleforge`/`gauntlet`; on an
+   older server without those fields, a holder named `crucibleforge`,
+   `gauntlet` or `crucibleforge-…`), it prints the holder and exits **6**
+   without touching the rig — benchmark runs are never disturbed.
 2. Confirm the model is in `/v1/models`; exit 5 if not.
 3. Inspect the loaded plan. If the model is already resident with
    `parallel >= 2` (or `>= 1` when `concurrency` is an integer), keep it.
@@ -164,7 +200,8 @@ warns and runs serially against whatever plan the server chooses.
 ## Structural verification
 
 Every translated document is checked before it is written; a failure aborts that
-file and leaves the old sibling in place. Checks: equal counts of h2/h3
+file and leaves the old sibling in place. Checks: no `no_translate` term
+injected that the source lacks; equal counts of h2/h3
 headings, `<svg>`/`</svg>`, `<pre><code>`/`</code></pre>`, `<code>`, tables,
 figures, `<img>`, `href="`, `src="`, `d="`, `<text>`; internal-link accounting;
 target-script presence (CJK for ja/zh, Arabic for ar, Hangul for ko); and an
@@ -195,7 +232,9 @@ callout — to an OpenAI-compatible API for correction. Everything below the fol
 stays untouched local-model output.
 
 It is off unless you enable it, and no endpoint, model or key is baked into the
-code: all three come from your config and environment.
+code: all three come from your config and environment. (If `api_key_env` is
+unset it names `DEEPSEEK_API_KEY`; point it at whichever variable holds your
+key.)
 
 ```toml
 [review]
@@ -206,6 +245,7 @@ api_key_env = "YOUR_API_KEY"           # the variable NAME; the value is never l
 sections = ["title", "excerpt", "description", "plain",
             "you_setup", "llm_does", "llm_prompt", "intro_through_tldr"]
 max_tokens = 16384
+temperature = 0.2
 reasoning_effort = "none"   # sent only when non-empty
 timeout_s = 120
 
@@ -246,5 +286,10 @@ python3 -m unittest discover -s tests
 ```
 
 Offline only: frontmatter splitting, chunking, structural verification, link
-rewriting, manifest round-trip, the state machine, discovery and config hashing.
-No test touches the network.
+rewriting, manifest round-trip, the state machine, discovery and config hashing,
+plus the review stage's section extraction, splicing and fail-closed reply
+handling against a fake client. No test touches the network.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

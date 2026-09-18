@@ -746,7 +746,7 @@ CHUNK_SRC = (
     '<h2>Setup</h2>\n'
     '<p>Run <code>transforge status</code> then <code>transforge run</code>, '
     'and read <a href="/projects/x/">the notes</a>.</p>\n'
-    '<pre><code>transforge run --site laserlloyd</code></pre>\n'
+    '<pre><code>transforge run --site example</code></pre>\n'
     '<p><img src="/a.png"> a caption sentence with enough words to clear the floor.</p>'
 )
 
@@ -1513,3 +1513,274 @@ class TestTextCliWiring(unittest.TestCase):
                     tf.main()
         self.assertEqual(cm.exception.code, 0)
         self.assertIn("text", buf.getvalue())
+
+
+# ------------------------------------------------- --files resolution (D3)
+class TestResolveFiles(unittest.TestCase):
+    """A --files spec that matches no source page is a usage error, never an
+    empty selection reported as '0 job(s)' / 'all requested siblings are
+    current'. Regression guard for the 2026-09-18 publish, where the page
+    still carried the scaffold's `translate: false` and every command said
+    'nothing to do'."""
+
+    def setUp(self):
+        self.d = tempfile.TemporaryDirectory()
+        self.addCleanup(self.d.cleanup)
+        self.root = self.d.name
+        write(os.path.join(self.root, "content/projects/foo.md"), "---\ntitle: Foo\n---\n\nbody\n")
+        write(os.path.join(self.root, "content/projects/bar.md"), "---\ntitle: Bar\n---\n\nbody\n")
+        write(os.path.join(self.root, "content/pages/foo.md"), "---\ntitle: Page\n---\n\nbody\n")
+        self.site = make_site(root=self.root, content_dirs=["content/projects"],
+                              languages=["ja"], lang_names={"ja": "Japanese"})
+
+    def test_none_when_no_files_given(self):
+        self.assertIsNone(tf.resolve_files(self.site, None))
+        self.assertIsNone(tf.resolve_files(self.site, []))
+
+    def test_relative_path(self):
+        self.assertEqual(tf.resolve_files(self.site, ["content/projects/foo.md"]),
+                         ["content/projects/foo.md"])
+
+    def test_absolute_path(self):
+        p = os.path.join(self.root, "content/projects/foo.md")
+        self.assertEqual(tf.resolve_files(self.site, [p]), ["content/projects/foo.md"])
+
+    def test_bare_slug(self):
+        self.assertEqual(tf.resolve_files(self.site, ["foo"]), ["content/projects/foo.md"])
+
+    def test_bare_filename(self):
+        self.assertEqual(tf.resolve_files(self.site, ["foo.md"]), ["content/projects/foo.md"])
+
+    def test_duplicates_collapse(self):
+        self.assertEqual(
+            tf.resolve_files(self.site, ["foo", "content/projects/foo.md"]),
+            ["content/projects/foo.md"])
+
+    def test_unmatched_exits_2(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            tf.resolve_files(self.site, ["nope"])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("no source page matched --files", err.getvalue())
+
+    def test_unmatched_reports_every_bad_spec(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            tf.resolve_files(self.site, ["foo", "nope", "alsonope"])
+        self.assertIn("nope", err.getvalue())
+        self.assertIn("alsonope", err.getvalue())
+
+    def test_opted_out_page_names_the_offending_key(self):
+        """The page exists but discovery skips it: say WHICH key, because that
+        is the actual fix and the silent version shipped an untranslated post."""
+        write(os.path.join(self.root, "content/projects/skipme.md"),
+              "---\ntitle: Skip\ntranslate: false\n---\n\nbody\n")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            tf.resolve_files(self.site, ["skipme"])
+        msg = err.getvalue()
+        self.assertIn("translate: false", msg)
+        self.assertIn("opts out of translation", msg)
+
+    def test_en_only_page_names_the_offending_key(self):
+        write(os.path.join(self.root, "content/projects/tpl.md"),
+              "---\ntitle: Tpl\nen_only: true\n---\n\nbody\n")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            tf.resolve_files(self.site, ["tpl"])
+        self.assertIn("en_only: true", err.getvalue())
+
+    def test_ambiguous_slug_exits_2(self):
+        site = make_site(root=self.root,
+                         content_dirs=["content/projects", "content/pages"],
+                         languages=["ja"], lang_names={"ja": "Japanese"})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            tf.resolve_files(site, ["foo"])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("ambiguous", err.getvalue())
+
+    def test_ambiguous_slug_resolvable_by_full_path(self):
+        site = make_site(root=self.root,
+                         content_dirs=["content/projects", "content/pages"],
+                         languages=["ja"], lang_names={"ja": "Japanese"})
+        self.assertEqual(tf.resolve_files(site, ["content/pages/foo.md"]),
+                         ["content/pages/foo.md"])
+
+    def test_plan_accepts_files_and_scopes_the_plan(self):
+        """`plan --files` must actually filter, not accept-and-ignore."""
+        with tempfile.TemporaryDirectory() as state:
+            orig = tf.STATE_DIR
+            tf.STATE_DIR = state
+            self.addCleanup(lambda: setattr(tf, "STATE_DIR", orig))
+            args = argparse.Namespace(site="t", langs=None,
+                                      files=["foo"], force=False)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = tf.cmd_plan(args, {"t": self.site})
+            self.assertEqual(rc, 0)
+            self.assertIn("content/projects/foo.md", out.getvalue())
+            self.assertNotIn("content/projects/bar.md", out.getvalue())
+            self.assertIn("1 job(s)", out.getvalue())
+
+    def test_plan_with_unmatched_files_exits_2_not_zero_jobs(self):
+        with tempfile.TemporaryDirectory() as state:
+            orig = tf.STATE_DIR
+            tf.STATE_DIR = state
+            self.addCleanup(lambda: setattr(tf, "STATE_DIR", orig))
+            args = argparse.Namespace(site="t", langs=None,
+                                      files=["not-a-page"], force=False)
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
+                    self.assertRaises(SystemExit) as cm:
+                tf.cmd_plan(args, {"t": self.site})
+            self.assertEqual(cm.exception.code, 2)
+            self.assertNotIn("0 job(s)", out.getvalue())
+
+
+# ------------------------------------------ glossary-bleed recovery (D4)
+class ScriptedTranslator:
+    """Stands in for Translator: replays a scripted (out_text, problems) per
+    construction, and records the site knobs and excluded terms it was built
+    with, so a test can assert the recovery ladder's shape."""
+
+    def __init__(self, site, script, seen):
+        self.site = site
+        self.script = script
+        self.seen = seen
+        self.exclude_terms = ()
+
+    def translate_document_checked(self, source_text, lang):
+        step = self.script.pop(0)
+        self.seen.append({"model": self.site.model,
+                          "prompt_template": self.site.prompt_template,
+                          "temperature": self.site.temperature,
+                          "extra_params": dict(self.site.extra_params or {}),
+                          "exclude_terms": tuple(self.exclude_terms)})
+        return step
+
+
+def _bleed_site(**over):
+    kw = dict(link_dirs=[], languages=["zh"], lang_names={"zh": "Chinese"},
+              no_translate=["DeepSeek", "OpenClaw"], temperature=0.7)
+    kw.update(over)
+    return make_site(**kw)
+
+
+def _run_recovery(site, script):
+    seen = []
+    it = iter(script)
+
+    def factory(s):
+        return ScriptedTranslator(s, [next(it)], seen)
+
+    out, via = tf.translate_with_recovery(site, None, SRC_NO_DEEPSEEK, "zh",
+                                          make_translator=factory)
+    return out, via, seen
+
+
+SRC_NO_DEEPSEEK = "<p>A page that never mentions the vendor.</p>"
+BLED = "<p>DeepSeek 的页面。</p>"
+CLEAN = "<p>一个页面。</p>"
+BLEED_PROBLEM = tf.GLOSSARY_PROBLEM_PREFIX + "DeepSeek (0 -> 1)"
+
+
+class TestTranslateWithRecovery(unittest.TestCase):
+    def test_clean_first_pass_reports_no_recovery(self):
+        out, via, seen = _run_recovery(_bleed_site(), [(CLEAN, [])])
+        self.assertEqual(out, CLEAN)
+        self.assertIsNone(via)
+        self.assertEqual(len(seen), 1)
+
+    def test_bleed_then_clean_is_recovered_by_glossary_strip(self):
+        out, via, seen = _run_recovery(
+            _bleed_site(), [(BLED, [BLEED_PROBLEM]), (CLEAN, [])])
+        self.assertEqual(out, CLEAN)
+        self.assertEqual(via, "glossary-strip")
+        self.assertEqual(len(seen), 2)
+
+    def test_retry_drops_the_injected_term_from_the_prompt(self):
+        _, _, seen = _run_recovery(
+            _bleed_site(), [(BLED, [BLEED_PROBLEM]), (CLEAN, [])])
+        self.assertEqual(seen[0]["exclude_terms"], ())
+        self.assertIn("DeepSeek", seen[1]["exclude_terms"])
+        self.assertNotIn("OpenClaw", seen[1]["exclude_terms"],
+                         "only the term that actually bled is dropped")
+
+    def test_a_term_used_by_the_source_is_never_dropped(self):
+        """Dropping a term the source really uses would let the model translate
+        a brand name away — worse than the bleed it is fixing."""
+        site = _bleed_site()
+        seen = []
+        script = [("<p>DeepSeek DeepSeek</p>", [BLEED_PROBLEM]), (CLEAN, [])]
+        it = iter(script)
+        tf.translate_with_recovery(
+            site, None, "<p>DeepSeek is here.</p>", "zh",
+            make_translator=lambda s: ScriptedTranslator(s, [next(it)], seen))
+        self.assertEqual(seen[1]["exclude_terms"], ())
+
+    def test_retry_samples_down_and_reseeds(self):
+        _, _, seen = _run_recovery(
+            _bleed_site(), [(BLED, [BLEED_PROBLEM]), (CLEAN, [])])
+        self.assertEqual(seen[0]["temperature"], 0.7)
+        self.assertLessEqual(seen[1]["temperature"], 0.2)
+        self.assertIn("seed", seen[1]["extra_params"])
+
+    def test_retry_budget_is_honoured_then_fallback_model(self):
+        site = _bleed_site(retry_on_verify_fail=2,
+                           fallback_model="unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q5_K_S",
+                           fallback_prompt_template="instruct")
+        out, via, seen = _run_recovery(site, [
+            (BLED, [BLEED_PROBLEM]), (BLED, [BLEED_PROBLEM]),
+            (BLED, [BLEED_PROBLEM]), (CLEAN, [])])
+        self.assertEqual(via, "fallback-model")
+        self.assertEqual(len(seen), 4, "1 first pass + 2 retries + 1 fallback")
+        self.assertEqual(seen[3]["model"], site.fallback_model)
+        self.assertEqual(seen[3]["prompt_template"], "instruct")
+
+    def test_exhausted_ladder_raises(self):
+        site = _bleed_site(retry_on_verify_fail=1, fallback_model="")
+        with self.assertRaises(RuntimeError) as cm:
+            _run_recovery(site, [(BLED, [BLEED_PROBLEM]), (BLED, [BLEED_PROBLEM])])
+        self.assertIn("after recovery", str(cm.exception))
+
+    def test_zero_retries_disables_the_ladder(self):
+        site = _bleed_site(retry_on_verify_fail=0, fallback_model="")
+        with self.assertRaises(RuntimeError):
+            _run_recovery(site, [(BLED, [BLEED_PROBLEM])])
+
+    def test_non_glossary_failure_is_not_retried(self):
+        """A code-span or link-prefix delta is deterministic: retrying it burns
+        rig time and cannot succeed."""
+        site = _bleed_site()
+        with self.assertRaises(RuntimeError) as cm:
+            _run_recovery(site, [(CLEAN, ["inline code: 3 -> 5"])])
+        self.assertIn("inline code", str(cm.exception))
+        self.assertNotIn("after recovery", str(cm.exception))
+
+    def test_recovery_never_mutates_the_configured_site(self):
+        site = _bleed_site()
+        _run_recovery(site, [(BLED, [BLEED_PROBLEM]), (CLEAN, [])])
+        self.assertEqual(site.temperature, 0.7)
+        self.assertEqual(site.no_translate, ["DeepSeek", "OpenClaw"])
+        self.assertNotIn("seed", site.extra_params)
+
+    def test_glossary_problems_filter(self):
+        self.assertEqual(tf.glossary_problems([BLEED_PROBLEM, "links: 1 -> 2"]),
+                         [BLEED_PROBLEM])
+
+
+class TestExcludeTermsInPrompt(unittest.TestCase):
+    """The exclude list must actually reach the prompt builder."""
+
+    def test_excluded_term_is_not_offered_to_the_model(self):
+        site = _bleed_site()
+        tr = tf.Translator(site, None)
+        text = "<p>DeepSeek and OpenClaw.</p>"
+        self.assertIn("DeepSeek", tr._terms_for(text))
+        tr.exclude_terms = ("DeepSeek",)
+        self.assertNotIn("DeepSeek", tr._terms_for(text))
+        self.assertIn("OpenClaw", tr._terms_for(text))
+
+    def test_default_exclude_is_empty(self):
+        self.assertEqual(tf.Translator(_bleed_site(), None).exclude_terms, ())

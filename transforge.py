@@ -165,6 +165,10 @@ DEFAULTS = {
     "max_tokens_body_retry": 24000,
     "max_chunk_chars": 12000,
     "extra_params": {},             # merged verbatim into the completion payload
+    # --- self-recovery from a glossary-bleed verification failure -----------
+    "retry_on_verify_fail": 2,      # same-model retries before the fallback model
+    "fallback_model": "",           # "" = no model fallback (retries only)
+    "fallback_prompt_template": "instruct",
 }
 
 CJK_RE = re.compile(r"[぀-ヿ一-鿿]")
@@ -220,7 +224,8 @@ class SiteConfig:
                   "temperature", "api_timeout", "priority", "disable_thinking",
                   "prompt_template", "max_tokens_fm", "max_tokens_fm_retry",
                   "max_tokens_body", "max_tokens_body_retry", "max_chunk_chars",
-                  "extra_params"):
+                  "extra_params", "retry_on_verify_fail", "fallback_model",
+                  "fallback_prompt_template"):
             setattr(self, k, merged[k])
         if self.concurrency != "auto":
             try:
@@ -330,8 +335,36 @@ def discover_sources(site):
         for fn in sorted(os.listdir(full)):
             if not fn.endswith((".md", ".html")) or LANG_SUFFIX_RE.search(fn):
                 continue
+            if _opts_out(os.path.join(full, fn)):
+                continue
             out.append(os.path.join(d, fn))
     return out
+
+
+# Frontmatter opt-out. A page whose prose lives in a bespoke TEMPLATE rather
+# than in its markdown body cannot be translated by translating the body: the
+# sibling comes back with a translated title above an entirely English page,
+# published under a foreign lang tag. Such a page declares `en_only: true`
+# (the site generator reads the same key) and is skipped here.
+_OPT_OUT_KEYS = ("en_only", "translate")
+
+def _opts_out(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            if fh.readline().strip() != "---":
+                return False
+            for line in fh:
+                if line.strip() == "---":
+                    return False
+                k, _, v = line.partition(":")
+                k, v = k.strip(), v.strip().lower()
+                if k == "en_only" and v in ("true", "yes"):
+                    return True
+                if k == "translate" and v in ("false", "no"):
+                    return True
+    except OSError:
+        return False
+    return False
 
 
 def sibling_path(rel_src, lang):
@@ -596,6 +629,12 @@ class Translator:
         self.rig = rig
 
     # ---- prompts
+    # Terms the recovery ladder has taken away from this page's prompts: a
+    # glossary entry the model INJECTED (0 -> n) although the source never
+    # mentions it. Set per-Translator, never per-site: the glossary itself is
+    # config and is not rewritten by a failing page.
+    exclude_terms = ()
+
     def _terms_for(self, text):
         """Glossary terms to hand the model for THIS segment only -- scoped to
         the ones that actually occur in `text` (same word-boundary matcher
@@ -608,7 +647,8 @@ class Translator:
         page-actual terms removes the temptation and shrinks the prompt."""
         if not self.site.no_translate or not text:
             return ""
-        terms = [t for t in self.site.no_translate if _term_re(t).search(text)]
+        terms = [t for t in self.site.no_translate
+                 if t not in self.exclude_terms and _term_re(t).search(text)]
         return ", ".join(terms) if terms else ""
 
     def _style(self, lang):
@@ -972,7 +1012,10 @@ class Translator:
         return "\n\n".join(p for p in parts if p)
 
     # ---- whole documents
-    def translate_document(self, source_text, lang):
+    def translate_document_checked(self, source_text, lang):
+        """-> (out_text, problems). Same work as translate_document() but it
+        hands the caller the verification verdict instead of raising, so a
+        recovery ladder can inspect WHY a page failed."""
         fm_text, body = split_frontmatter(source_text)
         if fm_text is None:
             out = self.translate_body(source_text, lang)
@@ -981,7 +1024,10 @@ class Translator:
             body_out = self.translate_body(body, lang)
             out = "---\n" + fm_out + "\n---\n\n" + body_out + "\n"
         out = rewrite_internal_links(out, lang, self.site)
-        problems = verify_structure(source_text, out, lang, self.site)
+        return out, verify_structure(source_text, out, lang, self.site)
+
+    def translate_document(self, source_text, lang):
+        out, problems = self.translate_document_checked(source_text, lang)
         if problems:
             raise RuntimeError("structural verification failed: " + "; ".join(problems))
         return out
@@ -1243,6 +1289,105 @@ def verify_structure(src, out, lang, site):
     return problems
 
 
+# ------------------------------------------------------ recovery from bleed
+GLOSSARY_PROBLEM_PREFIX = "glossary term injected by model: "
+
+
+def glossary_problems(problems):
+    """The injected-glossary entries in a verify_structure() problem list."""
+    return [p for p in problems if p.startswith(GLOSSARY_PROBLEM_PREFIX)]
+
+
+def site_variant(site, **overrides):
+    """A shallow copy of a SiteConfig with a few knobs changed, for a
+    single page's recovery attempt. Never mutates the configured site."""
+    v = copy.copy(site)
+    for k, val in overrides.items():
+        setattr(v, k, val)
+    return v
+
+
+def translate_with_recovery(site, rig, source_text, lang, make_translator=None,
+                            log=None):
+    """Translate one document, recovering by itself from a glossary bleed.
+
+    -> (out_text, recovered_via) where recovered_via is None, "glossary-strip"
+    or "fallback-model". Raises RuntimeError if every rung fails.
+
+    Why this exists: on 2026-09-18 the zh sibling failed structural
+    verification with `glossary term injected by model: DeepSeek (0 -> 1)` —
+    Hy-MT2 inventing a no_translate term the source never used. TransForge was
+    right to refuse the sibling, but it then stopped and a human had to type
+    "retry". Injection is a sampling accident, so a retry is exactly the right
+    move and the tool can make it itself.
+
+    The ladder, glossary failures only (a link-prefix or code-span delta is
+    deterministic — retrying it just burns rig time):
+      1. up to `retry_on_verify_fail` retries at a lower temperature, with the
+         injected terms dropped from this page's prompts when they do not occur
+         in the source at all (removing the temptation; a term the source DOES
+         use is kept, or the model would translate a brand name away).
+      2. `fallback_model` + `fallback_prompt_template` for this page only.
+    """
+    make_translator = make_translator or (lambda s: Translator(s, rig))
+
+    def say(msg):
+        if log:
+            log(msg)
+
+    tr = make_translator(site)
+    out, problems = tr.translate_document_checked(source_text, lang)
+    if not problems:
+        return out, None
+    if not glossary_problems(problems):
+        raise RuntimeError("structural verification failed: " + "; ".join(problems))
+
+    attempts = max(0, int(site.retry_on_verify_fail or 0))
+    excluded = set()
+    for i in range(attempts):
+        injected, _ = glossary_deltas(source_text, out, site)
+        # Only terms the SOURCE never uses may be taken out of the prompt.
+        for entry in injected:
+            term = entry.rsplit(" (", 1)[0]
+            if term in site.no_translate and not _term_re(term).search(source_text):
+                excluded.add(term)
+        # Sample down and re-roll: the previous sample was unfaithful, so
+        # repeating it at the same temperature asks the same dice to land
+        # differently (the same doctrine translate_chunk's retry already uses).
+        extra = dict(site.extra_params or {})
+        extra.setdefault("seed", 1000 + i)
+        variant = site_variant(site, temperature=min(site.temperature, 0.2),
+                               extra_params=extra)
+        tr = make_translator(variant)
+        tr.exclude_terms = tuple(sorted(excluded))
+        say(f"recovering (glossary-strip {i + 1}/{attempts}): dropped "
+            + (", ".join(sorted(excluded)) or "nothing")
+            + " from this page's prompt, resampling at "
+            f"temperature {variant.temperature}")
+        out, problems = tr.translate_document_checked(source_text, lang)
+        if not problems:
+            return out, "glossary-strip"
+        if not glossary_problems(problems):
+            raise RuntimeError("structural verification failed: "
+                               + "; ".join(problems))
+
+    if site.fallback_model:
+        variant = site_variant(site, model=site.fallback_model,
+                               prompt_template=site.fallback_prompt_template)
+        tr = make_translator(variant)
+        tr.exclude_terms = tuple(sorted(excluded))
+        say(f"recovering (fallback-model): {site.fallback_model} "
+            f"[{site.fallback_prompt_template}]")
+        out, problems = tr.translate_document_checked(source_text, lang)
+        if not problems:
+            return out, "fallback-model"
+
+    raise RuntimeError("structural verification failed after recovery "
+                       f"({attempts} retr(ies)"
+                       + (" + fallback model" if site.fallback_model else "")
+                       + "): " + "; ".join(problems))
+
+
 # --------------------------------------------------------------- run logic
 def backup_existing(site, out_abs, stamp):
     if not os.path.isfile(out_abs):
@@ -1286,13 +1431,18 @@ def cmd_run(args, sites):
     for l in langs:
         if l not in site.languages:
             die(f"language '{l}' not configured for site {site.name}")
-    files = normalize_files(site, args.files)
+    files = resolve_files(site, args.files)
     jobs, rows = build_jobs(site, manifest, langs, files, args.force)
     prune_manifest(manifest, rows)
     if args.limit:
         jobs = jobs[: args.limit]
     if not jobs:
-        print("nothing to do — all requested siblings are current")
+        # Reachable only with a NON-empty match set: resolve_files() has already
+        # exited 2 on a --files spec that named no source page, so "all current"
+        # can no longer be printed over an empty selection.
+        scope = (", ".join(files) if files else f"site {site.name}")
+        print(f"nothing to do — all requested siblings are current ({scope}, "
+              + ", ".join(langs) + ")")
         return 0
     print(f"{len(jobs)} job(s): "
           + ", ".join(sorted({j[2] for j in jobs}))
@@ -1361,19 +1511,28 @@ def cmd_run(args, sites):
             return
         try:
             source_text = read_text(src_abs)
-            out_text = tr.translate_document(source_text, lang)
+            out_text, recovered_via = translate_with_recovery(
+                site, rig, source_text, lang,
+                log=lambda m: print(f"RETRY[{state:>16}] {lang} {rel_src}: {m}",
+                                    file=sys.stderr))
             with lock:
                 backup_existing(site, out_abs, stamp)
             write_atomic(out_abs, out_text)
             dur = time.time() - t0
-            manifest.set(rel_src, lang, {
+            entry = {
                 "src_sha": src_sha, "out_sha": sha256_text(out_text),
                 "cfg": site.cfg_hash(), "model": site.model, "out": out_rel,
-                "translated_at": now_iso(), "duration_s": round(dur, 1)})
+                "translated_at": now_iso(), "duration_s": round(dur, 1)}
+            if recovered_via:
+                entry["recovered_via"] = recovered_via
+            manifest.set(rel_src, lang, entry)
             with lock:
                 results["ok"] += 1
+                if recovered_via:
+                    results["recovered"] = results.get("recovered", 0) + 1
                 manifest.save()
-            print(f"OK   [{state:>16}] {lang} {rel_src} ({dur:.0f}s)")
+            print(f"OK   [{state:>16}] {lang} {rel_src} ({dur:.0f}s)"
+                  + (f" [recovered_via: {recovered_via}]" if recovered_via else ""))
             _, increased = glossary_deltas(source_text, out_text, site)
             if increased:
                 print(f"WARN [{state:>16}] {lang} {rel_src}: glossary terms used "
@@ -1398,7 +1557,9 @@ def cmd_run(args, sites):
         list(ex.map(one, jobs))
     manifest.save()
     dur = time.time() - t_start
-    print(f"done: {results['ok']} ok, {results['fail']} failed, "
+    print(f"done: {results['ok']} ok"
+          + (f" ({results['recovered']} self-recovered)" if results.get("recovered") else "")
+          + f", {results['fail']} failed, "
           f"{results['leased']} deferred (rig leased) in {dur:.0f}s "
           f"({workers} workers)")
     if results["fail"]:
@@ -1415,6 +1576,9 @@ def under_root(path, root):
 
 
 def normalize_files(site, files):
+    """Legacy shape-only normaliser: absolute path under the site root -> path
+    relative to it, anything else left alone. It does NOT check that the result
+    names a real source page — use resolve_files() for that."""
     if not files:
         return None
     out = []
@@ -1422,6 +1586,106 @@ def normalize_files(site, files):
         p = os.path.abspath(os.path.expanduser(f))
         rel = os.path.relpath(p, site.root) if under_root(p, site.root) else f
         out.append(rel)
+    return out
+
+
+def _page_opt_out_reason(path):
+    """Which frontmatter key, if any, makes discovery skip this page."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            if fh.readline().strip() != "---":
+                return None
+            for line in fh:
+                if line.strip() == "---":
+                    return None
+                k, _, v = line.partition(":")
+                k, v = k.strip(), v.strip().lower()
+                if k == "en_only" and v in ("true", "yes"):
+                    return "en_only: true"
+                if k == "translate" and v in ("false", "no"):
+                    return "translate: false"
+    except OSError:
+        return None
+    return None
+
+
+def _opt_out_hint(site, spec):
+    """If a --files spec matches a page that EXISTS on disk but is skipped by
+    discovery, say so and name the key. This is the whole point of the check:
+    on 2026-09-18 a `--files <slug>` run silently produced '0 job(s)'
+    because the page still carried the scaffold's `translate: false`, and the
+    publish shipped untranslated."""
+    stem = os.path.splitext(os.path.basename(spec))[0]
+    for d in site.content_dirs:
+        full = os.path.join(site.root, d)
+        if not os.path.isdir(full):
+            continue
+        for fn in sorted(os.listdir(full)):
+            if not fn.endswith((".md", ".html")) or LANG_SUFFIX_RE.search(fn):
+                continue
+            if os.path.splitext(fn)[0] != stem:
+                continue
+            reason = _page_opt_out_reason(os.path.join(full, fn))
+            if reason:
+                return (f"{os.path.join(d, fn)} exists but opts out of "
+                        f"translation ({reason}) — remove that key to translate it")
+    return None
+
+
+def resolve_files(site, specs):
+    """Map each --files spec onto a discovered source page, or die.
+
+    Accepts a bare slug ('foo'), a bare filename ('foo.md'), a path relative to
+    the site root ('content/projects/foo.md') or an absolute path. A spec that
+    matches NOTHING is a usage error (exit 2), never a silent empty selection:
+    'plan --files <slug>' printing '0 job(s)' and 'run --files <slug>' printing
+    'nothing to do — all requested siblings are current' both read as success
+    and hid a genuinely untranslated page.
+    """
+    if not specs:
+        return None
+    sources = discover_sources(site)
+    by_rel = {r: r for r in sources}
+    by_base = {}
+    by_stem = {}
+    for r in sources:
+        by_base.setdefault(os.path.basename(r), []).append(r)
+        by_stem.setdefault(os.path.splitext(os.path.basename(r))[0], []).append(r)
+    resolved, unmatched, ambiguous = [], [], []
+    for spec in specs:
+        p = os.path.abspath(os.path.expanduser(spec))
+        rel = os.path.relpath(p, site.root) if under_root(p, site.root) else spec
+        rel = os.path.normpath(rel)
+        if rel in by_rel:
+            resolved.append(rel)
+            continue
+        base = os.path.basename(rel)
+        hits = by_base.get(base) or by_stem.get(os.path.splitext(base)[0]) or []
+        if len(hits) == 1:
+            resolved.append(hits[0])
+        elif len(hits) > 1:
+            ambiguous.append((spec, hits))
+        else:
+            unmatched.append(spec)
+    if ambiguous:
+        lines = [f"  {s} matches: " + ", ".join(h) for s, h in ambiguous]
+        die("ambiguous --files argument(s) — give the path relative to the "
+            "site root:\n" + "\n".join(lines))
+    if unmatched:
+        lines = []
+        for s in unmatched:
+            hint = _opt_out_hint(site, s)
+            lines.append(f"  {s}" + (f"  ({hint})" if hint else ""))
+        die(f"no source page matched --files for site {site.name}:\n"
+            + "\n".join(lines)
+            + "\nRun `transforge status --site " + site.name
+            + " -v` to list the pages this site knows about.")
+    # de-duplicate, keep first-seen order
+    seen, out = set(), []
+    for r in resolved:
+        if r not in seen:
+            seen.add(r)
+            out.append(r)
     return out
 
 
@@ -1462,18 +1726,19 @@ def cmd_plan(args, sites):
     site = pick_site(sites, args.site)
     manifest = Manifest(site.name)
     langs = args.langs or site.languages
-    jobs, _ = build_jobs(site, manifest, langs, normalize_files(site, args.files),
-                         args.force)
+    files = resolve_files(site, args.files)
+    jobs, _ = build_jobs(site, manifest, langs, files, args.force)
     for rel_src, lang, state, _ in jobs:
         print(f"{state:>16} {lang} {rel_src} -> {sibling_path(rel_src, lang)}")
-    print(f"{len(jobs)} job(s)")
+    scope = (", ".join(files) if files else f"site {site.name}")
+    print(f"{len(jobs)} job(s) ({scope}, " + ", ".join(langs) + ")")
     return 0
 
 
 def cmd_accept(args, sites):
     site = pick_site(sites, args.site)
     manifest = Manifest(site.name)
-    files = normalize_files(site, args.files)
+    files = resolve_files(site, args.files)
     langs = args.langs or site.languages
     n = 0
     for rel_src in discover_sources(site):
@@ -1659,7 +1924,8 @@ def cmd_config(args, sites):
         print(f"[sites.{name}]  cfg_hash={site.cfg_hash()}")
         for k in ("root", "content_dirs", "languages", "model", "endpoint",
                   "concurrency", "ctx_per_slot", "prompt_template", "temperature",
-                  "no_translate", "link_dirs"):
+                  "no_translate", "link_dirs", "retry_on_verify_fail",
+                  "fallback_model", "fallback_prompt_template"):
             print(f"  {k} = {getattr(site, k)}")
     return 0
 
