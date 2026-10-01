@@ -638,28 +638,31 @@ def selftest() -> int:
         # The negatives are the ones that matter: a scanner that flags
         # `/home/you` in a deploy guide, or the documented CGNAT range, gets
         # turned off within a week and then catches nothing at all.
+        # Key-shaped fixtures are assembled at runtime ("sk-" + "a" * 30) so
+        # no literal credential-shaped string sits in this file for a
+        # third-party secret scanner to flag.
         positives = {
             "tailscale-magicdns": "https://mybox.tailc0ffee.ts.net:8443/",  # scrub-ok: selftest fixture
             "tailnet-id":         "tailnet is tailc0ffee00",  # scrub-ok: selftest fixture
-            "lan-ip-192":         "rig MCP at http://192.168.9.44:8700/mcp",  # scrub-ok: selftest fixture
+            "lan-ip-192":         "rig MCP at http://192.168.1.10:8080/mcp",  # scrub-ok: selftest fixture
             "lan-ip-10":          "base_url: http://10.1.2.3:1234/v1",  # scrub-ok: selftest fixture
             "lan-ip-172":         "server 172.20.0.5 serves the judge",  # scrub-ok: selftest fixture
-            "tailnet-ip-100":     "tailnet address 100.66.12.9",  # scrub-ok: selftest fixture
+            "tailnet-ip-100":     "tailnet address 100.64.1.2",  # scrub-ok: selftest fixture
             "home-path-bare":     "cd /var/home/operator",  # scrub-ok: selftest fixture
             "home-path-slash":    "logs in /home/operator/.local/share",  # scrub-ok: selftest fixture
             "runtime-uid":        "XDG_RUNTIME_DIR=/run/user/1000",  # scrub-ok: selftest fixture
             "email":              "contact me at person@somecompany.co.uk",  # scrub-ok: selftest fixture
-            "openai-key":         "sk-abcdefghij0123456789abcdefghij",  # scrub-ok: selftest fixture
-            "stripe-key":         "sk_live_abcdefghij0123456789",  # scrub-ok: selftest fixture
-            "github-pat":         "github_pat_11ABCDEFG0abcdefghijkl",  # scrub-ok: selftest fixture
-            "github-oauth":       "gho_16CharsAndMoreToPassTheLengthGate12",  # scrub-ok: selftest fixture
-            "gitlab-pat":         "glpat-abcdefghij0123456789",  # scrub-ok: selftest fixture
-            "slack-token":        "xoxb-1234567890-abcdefghijkl",  # scrub-ok: selftest fixture
-            "google-key":         "AIzaSyA0123456789abcdefghijklmnopqrstuvw",  # scrub-ok: selftest fixture
+            "openai-key":         "sk-" + "a" * 30,
+            "stripe-key":         "sk_" + "live_" + "a" * 20,
+            "github-pat":         "github_" + "pat_" + "1" * 22,
+            "github-oauth":       "gho" + "_" + "A" * 36,
+            "gitlab-pat":         "glpat" + "-" + "a" * 20,
+            "slack-token":        "xoxb" + "-1234567890-" + "a" * 12,
+            "google-key":         "AI" + "za" + "A" * 35,
             "bearer-token":       "Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345",  # scrub-ok: selftest fixture
-            "jwt":                "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N",  # scrub-ok: selftest fixture
-            "pem-pgp":            "-----BEGIN PGP PRIVATE KEY BLOCK-----",  # scrub-ok: selftest fixture
-            "pem-openssh":        "-----BEGIN OPENSSH PRIVATE KEY-----",  # scrub-ok: selftest fixture
+            "jwt":                ".".join(["ey" + "J" + "a" * 10] * 3),
+            "pem-pgp":            "-----BEGIN PGP " + "PRIVATE KEY BLOCK-----",
+            "pem-openssh":        "-----BEGIN OPENSSH " + "PRIVATE KEY-----",
             "session-url":        "see https://claude.ai/code/session_01ABCdef",  # scrub-ok: selftest fixture
             "session-trailer":    "Claude-Session: https://example.invalid/x",  # scrub-ok: selftest fixture
             "ai-coauthor":        "Co-Authored-By: Claude <noreply@anthropic.com>",  # scrub-ok: selftest fixture
@@ -675,8 +678,8 @@ def selftest() -> int:
             "doc-range-ip":       "example endpoint http://192.0.2.10:1234/v1",
             "version-triplet":    "suite revision 3.2.0 build 10.0.0",
             "cgnat-range-spaced": "the 100.64.0.0 / 10 block",
-            "home-placeholder-1": "mount /home/you/.openclaw into the container",
-            "home-placeholder-2": "ReadOnlyPaths=/home/youruser/.openclaw",
+            "home-placeholder-1": "mount /home/you/.myapp into the container",
+            "home-placeholder-2": "ReadOnlyPaths=/home/youruser/.myapp",
             "home-placeholder-3": "home is /home/app in the container",
             "home-placeholder-4": "cd ~   # /home/<you> — the Linux disk",
             "home-placeholder-5": "reject a typed path like /home/secret.png",
@@ -742,7 +745,7 @@ def selftest() -> int:
         # useless or unusably noisy.
         (root / ".gitignore").write_text("ignored.log\n", encoding="utf-8")
         (root / "ignored.log").write_text(
-            "judge at http://192.168.9.44:1234/v1\n",  # scrub-ok: selftest fixture
+            "judge at http://192.168.1.10:1234/v1\n",  # scrub-ok: selftest fixture
             encoding="utf-8")
         if any("ignored.log" in p for p in scan(root)):
             failures.append("a git-ignored file was scanned by default "

@@ -5,7 +5,45 @@ on:
   pull_request:
 
 jobs:
+  privacy:
+    # Runs first, on its own runner, with no toolchain: a leak should fail the
+    # build before anything else spends time on it.
+    #
+    # scripts/scrub-rules.local.txt is git-ignored on purpose (publishing the
+    # list of words that must never be published is its own leak), so in CI
+    # the personal-identifier rules are NOT loaded and this job verifies the
+    # generic patterns only (keys, tokens, private keys, JWTs, home paths,
+    # private/tailnet IPs, emails). The maintainer's clone runs the name and
+    # hostname rules via the git hooks (sh scripts/install-hooks.sh).
+    name: no private data
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 because the commit-range steps need the PR's base
+      # commit, which the default shallow clone does not contain.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan the tree
+        run: python3 scripts/scrub_check.py
+      - name: Scan the TREE of every commit in the pull request
+        if: github.event_name == 'pull_request'
+        # Not just the head: a secret added in one commit and removed in the
+        # next still publishes, and a head-only scan calls that clean.
+        run: |
+          for sha in $(git rev-list --reverse \
+              "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"); do
+            python3 scripts/scrub_check.py --rev "$sha"
+          done
+      - name: Scan the commit messages being pushed
+        if: github.event_name == 'pull_request'
+        run: |
+          python3 scripts/scrub_check.py --commit-range \
+            "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+      - name: Prove the scanner still works
+        run: python3 scripts/scrub_check.py --selftest
+
   unittest:
+    needs: privacy
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

@@ -291,6 +291,21 @@ rewriting, manifest round-trip, the state machine, discovery and config hashing,
 plus the review stage's section extraction, splicing and fail-closed reply
 handling against a fake client. No test touches the network.
 
+## Privacy checks
+
+`scripts/scrub_check.py` scans for credentials, private/tailnet IPs, home paths
+and similar before anything is published. CI runs it on every push and pull
+request (tree, every PR commit's tree, commit messages, and a self-test). In a
+local clone, install the matching git hooks once:
+
+```bash
+sh scripts/install-hooks.sh      # pre-commit, commit-msg, pre-push
+python3 scripts/scrub_check.py --selftest
+```
+
+Personal-identifier rules (names, hostnames) go in the git-ignored
+`scripts/scrub-rules.local.txt`, one regex per line.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
