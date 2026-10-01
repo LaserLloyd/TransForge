@@ -1476,7 +1476,6 @@ def cmd_run(args, sites):
         workers = max(1, args.workers)
     print(f"workers: {workers}")
 
-    tr = Translator(site, rig)
     stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     results = {"ok": 0, "fail": 0, "leased": 0}
     lock = threading.Lock()
