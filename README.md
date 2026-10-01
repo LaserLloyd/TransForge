@@ -174,9 +174,9 @@ Re-run them deliberately with `--force --files ...`, or leave them.
 `warmup` (run automatically by `run`, `single` and `text` unless `--no-warmup`) does:
 
 1. Check `/api/leases`. If a benchmark holds a lease (the server marks it
-   `kind = "benchmark"` or `holder_family` `crucibleforge`/`gauntlet`; on an
-   older server without those fields, a holder named `crucibleforge`,
-   `gauntlet` or `crucibleforge-…`), it prints the holder and exits **6**
+   `kind = "benchmark"` or `holder_family` `crucibleforge`; on an
+   older server without those fields, a holder named `crucibleforge` or
+   `crucibleforge-…`), it prints the holder and exits **6**
    without touching the rig — benchmark runs are never disturbed.
 2. Confirm the model is in `/v1/models`; exit 5 if not.
 3. Inspect the loaded plan. If the model is already resident with

@@ -5,7 +5,7 @@ sections of translated siblings.
 Readers mostly see only the top of a page, so this stage sends the frontmatter
 summary fields (plain, you_setup, llm_does, llm_prompt, title, excerpt,
 description) plus the body intro through the tl;dr callout to a configurable
-OpenAI-compatible reviewer model ("the Flash API bot"), which corrects
+OpenAI-compatible reviewer model, which corrects
 mistranslations, meaning inversions and grammar slips. Everything else stays
 local-model output.
 
@@ -162,7 +162,7 @@ def sections_sha(src_parts, out_parts, rc):
 
 
 # ------------------------------------------------------------ API client
-class FlashClient:
+class ReviewClient:
     def __init__(self, rc):
         self.rc = rc
         self.url = rc.base_url.rstrip("/") + "/chat/completions"
@@ -412,7 +412,7 @@ def cmd_review(args, sites):
                   + ", ".join(unknown), file=sys.stderr)
             return 2
 
-    client = FlashClient(rc)
+    client = ReviewClient(rc)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     stats = {"reviewed": 0, "changed": 0, "skipped": 0, "fail": 0,
              "partial": 0, "edited": 0}
@@ -510,8 +510,8 @@ def cmd_review(args, sites):
             # never asked to prefix internal links with /<lang>/, so reviewer
             # output arrives unprefixed and verify_structure rightly rejects
             # it. Without this the whole review exits 1 on a defect the
-            # pipeline already knows how to fix -- `translate-web-changes`
-            # failed five nights running on exactly one such link.
+            # pipeline already knows how to fix -- the nightly translation
+            # job failed five nights running on exactly one such link.
             # Scoped to the reviewed sections so untouched regions still can't
             # move (the no-op splice check below).
             def _prefix(v):

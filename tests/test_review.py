@@ -75,7 +75,7 @@ you_setup:
 
 
 class FakeClient:
-    """Stands in for FlashClient; returns a canned reply, counts calls."""
+    """Stands in for ReviewClient; returns a canned reply, counts calls."""
     instances = []
 
     def __init__(self, rc):
@@ -130,8 +130,8 @@ class ReviewHarness(unittest.TestCase):
         tf.CONFIG_PATH = os.path.join(root, "config.toml")
         self.write_config(enabled=True)
 
-        self._old_client = rv.FlashClient
-        rv.FlashClient = FakeClient
+        self._old_client = rv.ReviewClient
+        rv.ReviewClient = FakeClient
         FakeClient.instances = []
         FakeClient.next_reply = "{}"
         os.environ["TEST_REVIEW_KEY"] = "k"
@@ -148,7 +148,7 @@ class ReviewHarness(unittest.TestCase):
     def tearDown(self):
         tf.STATE_DIR = self._old_state
         tf.CONFIG_PATH = self._old_cfgpath
-        rv.FlashClient = self._old_client
+        rv.ReviewClient = self._old_client
         self.tmp.cleanup()
 
     def write(self, rel, text):
@@ -221,7 +221,7 @@ class TestExtraction(unittest.TestCase):
         self.assertNotIn("冒頭の段落", out)               # old intro replaced
 
 
-class TestFlashClientOverflow(unittest.TestCase):
+class TestReviewClientOverflow(unittest.TestCase):
     """A reasoning model can spend the whole budget thinking and answer with
     an empty string + finish_reason=length. That must be recovered, not
     mistaken for a refusal."""
@@ -230,7 +230,7 @@ class TestFlashClientOverflow(unittest.TestCase):
         rc = rv.ReviewConfig({**rv.REVIEW_DEFAULTS, "base_url": "https://x.invalid",
                               "model": "m", "api_key_env": "TEST_REVIEW_KEY",
                               **cfg})
-        c = rv.FlashClient(rc)
+        c = rv.ReviewClient(rc)
         self.posts = []
 
         def fake_post(system, user, max_tokens, reasoning_effort):
@@ -355,7 +355,7 @@ class TestValidateReply(unittest.TestCase):
 class TestCmdReview(ReviewHarness):
     def test_disabled_makes_zero_api_calls(self):
         self.write_config(enabled=False)
-        rv.FlashClient = ExplodingClient
+        rv.ReviewClient = ExplodingClient
         self.assertEqual(self.run_review(), 0)
 
     def test_missing_key_env_exits_7(self):
@@ -395,7 +395,7 @@ class TestCmdReview(ReviewHarness):
     def test_reviewer_link_is_prefixed_instead_of_failing(self):
         """The reviewer is never asked to write /<lang>/ links, so its output
         arrives unprefixed and verify_structure rejects it — which used to fail
-        the whole run (translate-web-changes exited 1 five nights running on one
+        the whole run (the nightly translation job exited 1 five nights running on one
         such link). The deterministic prefix pass now runs on reviewed sections
         exactly as it does on translated ones."""
         self.site.link_dirs = ["projects"]

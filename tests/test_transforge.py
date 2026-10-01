@@ -794,7 +794,7 @@ class TestStructureDeltas(unittest.TestCase):
 
 
 class TestTranslateChunkContract(unittest.TestCase):
-    """The regression that broke translate-web-changes for es/zh: an inline
+    """The regression that broke the nightly translation job for es/zh: an inline
     <code> count drift is recoverable model noise, but had no retry — only
     href/src did — so it surfaced as a hard document failure."""
 

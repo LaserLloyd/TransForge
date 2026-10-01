@@ -65,7 +65,7 @@ PIN_ENV_FILE = os.path.expanduser(os.environ.get("TRANSFORGE_PIN_ENV_FILE", ""))
 # FALLBACK ONLY since StudioForge 1.26-09-04: every lease record now carries
 # `holder_family` + `kind` and _is_bench_lease() prefers those; the prefix
 # hack runs only for a record that has neither key (an older server).
-BENCH_LEASE_HOLDERS = ("crucibleforge", "gauntlet")
+BENCH_LEASE_HOLDERS = ("crucibleforge",)
 
 def _is_bench_holder(holder: str) -> bool:
     """FALLBACK: True for any CrucibleForge lease, including its phase-suffixed
@@ -193,8 +193,8 @@ def read_text(path):
 
 
 def write_atomic(path, text, mode=0o644):
-    """Atomic write with explicit world-readable mode (dsh's 0600 default once
-    403'd production after an rsync — never inherit a restrictive umask here)."""
+    """Atomic write with explicit world-readable mode (a 0600 file copied to a
+    web server answers 403 -- never inherit a restrictive umask here)."""
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
@@ -935,7 +935,7 @@ class Translator:
         STRUCTURE_CHECKS markers. Anything else the model dropped or invented --
         inline <code> spans above all -- therefore had no retry at all: the
         first bad sample propagated straight to a hard document failure. That is
-        what failed `translate-web-changes` for es and zh on three consecutive
+        what failed the nightly translation job for es and zh on three consecutive
         nights on the same code-dense article, with a DIFFERENT count each night
         (es 46->49 then 46->48, zh 46->45 twice) -- i.e. recoverable model
         nondeterminism reported as a permanent error. Retrying on the same
@@ -1061,7 +1061,7 @@ def count(text, pat):
 # <code>bench-llm</code> once plus the bare word bench-llm three more times in
 # prose, and it marks up the prose repeats too (inline code 3 -> 5). That is a
 # stable bias, not sampling noise -- it survived every retry -- and it is what
-# failed `translate-web-changes` for es and zh three nights running. It cannot
+# failed the nightly translation job for es and zh three nights running. It cannot
 # be prompted away on a pure-MT model whose instruction surface is one line.
 # A placeholder the model cannot interpret removes the temptation entirely and
 # makes the code-span count structurally guaranteed instead of merely checked.
@@ -1484,8 +1484,8 @@ def cmd_run(args, sites):
     lease_state = {"checked": time.time(), "stop": False}
 
     def lease_gate():
-        """Throttled bench-lease re-check between jobs: once a CrucibleForge/
-        gauntlet lease appears mid-run, stop starting new jobs."""
+        """Throttled bench-lease re-check between jobs: once a CrucibleForge
+        lease appears mid-run, stop starting new jobs."""
         with lock:
             if lease_state["stop"]:
                 return True
