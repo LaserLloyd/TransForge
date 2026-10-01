@@ -56,9 +56,10 @@ import yaml
 
 CONFIG_PATH = os.path.expanduser("~/.config/transforge/config.toml")
 STATE_DIR = os.path.expanduser("~/.local/state/transforge")
-# Optional fallback location for STUDIOFORGE_MCP_PIN (an OpenClaw install);
-# the environment variable takes precedence and is the portable way to set it.
-PIN_ENV_FILE = os.path.expanduser("~/.openclaw/gateway.systemd.env")
+# Optional file containing a STUDIOFORGE_MCP_PIN=... line, named by
+# $TRANSFORGE_PIN_ENV_FILE. Opt-in only: no location is ever guessed. The
+# STUDIOFORGE_MCP_PIN environment variable takes precedence over the file.
+PIN_ENV_FILE = os.path.expanduser(os.environ.get("TRANSFORGE_PIN_ENV_FILE", ""))
 
 # lease holders whose runs must not be disturbed (CrucibleForge doctrine).
 # FALLBACK ONLY since StudioForge 1.26-09-04: every lease record now carries
@@ -427,19 +428,21 @@ class Rig:
             return json.loads(raw) if raw else {}
 
     def pin(self):
-        """Management PIN: environment first, then an optional env-file."""
+        """Management PIN: environment first, then the opt-in file named by
+        $TRANSFORGE_PIN_ENV_FILE (if set)."""
         if self._pin is None:
             self._pin = os.environ.get("STUDIOFORGE_MCP_PIN", "").strip()
             if self._pin:
                 return self._pin
-            try:
-                for line in read_text(PIN_ENV_FILE).splitlines():
-                    m = re.match(r"STUDIOFORGE_MCP_PIN=\"?([^\s\"]+)\"?", line.strip())
-                    if m:
-                        self._pin = m.group(1)
-                        break
-            except OSError:
-                pass
+            if PIN_ENV_FILE:
+                try:
+                    for line in read_text(PIN_ENV_FILE).splitlines():
+                        m = re.match(r"STUDIOFORGE_MCP_PIN=\"?([^\s\"]+)\"?", line.strip())
+                        if m:
+                            self._pin = m.group(1)
+                            break
+                except OSError:
+                    pass
         return self._pin
 
     def models(self):

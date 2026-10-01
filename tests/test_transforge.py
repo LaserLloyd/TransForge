@@ -1784,3 +1784,43 @@ class TestExcludeTermsInPrompt(unittest.TestCase):
 
     def test_default_exclude_is_empty(self):
         self.assertEqual(tf.Translator(_bleed_site(), None).exclude_terms, ())
+
+
+class TestPinSource(unittest.TestCase):
+    """The management PIN comes from $STUDIOFORGE_MCP_PIN or from the file
+    named by $TRANSFORGE_PIN_ENV_FILE -- never from a guessed location."""
+
+    def _rig(self):
+        site = mock.Mock(endpoint="http://127.0.0.1:1/")
+        return tf.Rig(site)
+
+    def test_env_var_wins(self):
+        with mock.patch.dict(os.environ, {"STUDIOFORGE_MCP_PIN": "11112222"}), \
+             mock.patch.object(tf, "PIN_ENV_FILE", "/nonexistent"):
+            self.assertEqual(self._rig().pin(), "11112222")
+
+    def test_no_file_configured_reads_nothing(self):
+        env = {k: v for k, v in os.environ.items() if k != "STUDIOFORGE_MCP_PIN"}
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(tf, "PIN_ENV_FILE", ""), \
+             mock.patch.object(tf, "read_text") as rt:
+            self.assertEqual(self._rig().pin(), "")
+            rt.assert_not_called()
+
+    def test_opt_in_file_is_read(self):
+        env = {k: v for k, v in os.environ.items() if k != "STUDIOFORGE_MCP_PIN"}
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "pin.env")
+            with open(f, "w", encoding="utf-8") as fh:
+                fh.write('OTHER=1\nSTUDIOFORGE_MCP_PIN="33334444"\n')
+            with mock.patch.dict(os.environ, env, clear=True), \
+                 mock.patch.object(tf, "PIN_ENV_FILE", f):
+                self.assertEqual(self._rig().pin(), "33334444")
+
+    def test_module_default_is_opt_in(self):
+        env = {k: v for k, v in os.environ.items() if k != "TRANSFORGE_PIN_ENV_FILE"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            spec = importlib.util.spec_from_file_location("tf_fresh", tf.__file__)
+            fresh = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(fresh)
+        self.assertEqual(fresh.PIN_ENV_FILE, "")

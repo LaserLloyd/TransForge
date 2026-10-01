@@ -193,9 +193,10 @@ Worker count is the model's live `parallel` slot count when
 overrides it. Smaller `ctx_per_slot` generally buys more slots.
 
 Steps 3–4 need the server's management PIN, sent as `X-MCP-Pin`. It is read
-from the `STUDIOFORGE_MCP_PIN` environment variable, falling back to
-`~/.openclaw/gateway.systemd.env` if that file exists. Without it TransForge
-warns and runs serially against whatever plan the server chooses.
+from the `STUDIOFORGE_MCP_PIN` environment variable or, if that is unset, from
+a `STUDIOFORGE_MCP_PIN=...` line in the file named by `TRANSFORGE_PIN_ENV_FILE`
+(opt-in; no file location is ever guessed). Without either TransForge warns and
+runs serially against whatever plan the server chooses.
 
 ## Structural verification
 
