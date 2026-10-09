@@ -1296,6 +1296,15 @@ def verify_structure(src, out, lang, site):
 GLOSSARY_PROBLEM_PREFIX = "glossary term injected by model: "
 
 
+# translate_chunk's own hard errors: the chunk already had three same-model
+# attempts plus subdivision, so the only rung left is a DIFFERENT model.
+CHUNK_STRUCTURE_ERRORS = ("body chunk structure mismatch", "body chunk still truncated")
+
+
+def is_chunk_structure_error(exc):
+    return isinstance(exc, RuntimeError) and str(exc).startswith(CHUNK_STRUCTURE_ERRORS)
+
+
 def glossary_problems(problems):
     """The injected-glossary entries in a verify_structure() problem list."""
     return [p for p in problems if p.startswith(GLOSSARY_PROBLEM_PREFIX)]
@@ -1331,6 +1340,13 @@ def translate_with_recovery(site, rig, source_text, lang, make_translator=None,
          in the source at all (removing the temptation; a term the source DOES
          use is kept, or the model would translate a brand name away).
       2. `fallback_model` + `fallback_prompt_template` for this page only.
+
+    Structure failures (2026-10-09): a chunk that translate_chunk could not
+    get back faithful (e.g. ar "inline code 29->28" three nights running) or a
+    non-glossary verify_structure problem is NOT retried on the same model —
+    that model already had its retries — but it DOES get the fallback-model
+    rung when one is configured: a different model is a different sample, not
+    the same dice. Without a fallback model it raises exactly as before.
     """
     make_translator = make_translator or (lambda s: Translator(s, rig))
 
@@ -1338,15 +1354,41 @@ def translate_with_recovery(site, rig, source_text, lang, make_translator=None,
         if log:
             log(msg)
 
+    excluded = set()
+
+    def fallback_or_raise(reason):
+        if not site.fallback_model:
+            raise RuntimeError(reason)
+        variant = site_variant(site, model=site.fallback_model,
+                               prompt_template=site.fallback_prompt_template)
+        tr2 = make_translator(variant)
+        tr2.exclude_terms = tuple(sorted(excluded))
+        say(f"recovering (fallback-model after structure failure): "
+            f"{site.fallback_model} [{site.fallback_prompt_template}] — {reason}")
+        try:
+            out2, problems2 = tr2.translate_document_checked(source_text, lang)
+        except RuntimeError as exc:
+            if not is_chunk_structure_error(exc):
+                raise
+            raise RuntimeError(f"{reason}; fallback model also failed: {exc}") from exc
+        if not problems2:
+            return out2, "fallback-model"
+        raise RuntimeError(f"{reason}; fallback model also failed: "
+                           + "; ".join(problems2))
+
     tr = make_translator(site)
-    out, problems = tr.translate_document_checked(source_text, lang)
+    try:
+        out, problems = tr.translate_document_checked(source_text, lang)
+    except RuntimeError as exc:
+        if not is_chunk_structure_error(exc):
+            raise
+        return fallback_or_raise(str(exc))
     if not problems:
         return out, None
     if not glossary_problems(problems):
-        raise RuntimeError("structural verification failed: " + "; ".join(problems))
+        return fallback_or_raise("structural verification failed: " + "; ".join(problems))
 
     attempts = max(0, int(site.retry_on_verify_fail or 0))
-    excluded = set()
     for i in range(attempts):
         injected, _ = glossary_deltas(source_text, out, site)
         # Only terms the SOURCE never uses may be taken out of the prompt.
@@ -1367,12 +1409,17 @@ def translate_with_recovery(site, rig, source_text, lang, make_translator=None,
             + (", ".join(sorted(excluded)) or "nothing")
             + " from this page's prompt, resampling at "
             f"temperature {variant.temperature}")
-        out, problems = tr.translate_document_checked(source_text, lang)
+        try:
+            out, problems = tr.translate_document_checked(source_text, lang)
+        except RuntimeError as exc:
+            if not is_chunk_structure_error(exc):
+                raise
+            return fallback_or_raise(str(exc))
         if not problems:
             return out, "glossary-strip"
         if not glossary_problems(problems):
-            raise RuntimeError("structural verification failed: "
-                               + "; ".join(problems))
+            return fallback_or_raise("structural verification failed: "
+                                     + "; ".join(problems))
 
     if site.fallback_model:
         variant = site_variant(site, model=site.fallback_model,
@@ -1381,9 +1428,15 @@ def translate_with_recovery(site, rig, source_text, lang, make_translator=None,
         tr.exclude_terms = tuple(sorted(excluded))
         say(f"recovering (fallback-model): {site.fallback_model} "
             f"[{site.fallback_prompt_template}]")
-        out, problems = tr.translate_document_checked(source_text, lang)
-        if not problems:
-            return out, "fallback-model"
+        try:
+            out, problems = tr.translate_document_checked(source_text, lang)
+        except RuntimeError as exc:
+            if not is_chunk_structure_error(exc):
+                raise
+            problems = [str(exc)]
+        else:
+            if not problems:
+                return out, "fallback-model"
 
     raise RuntimeError("structural verification failed after recovery "
                        f"({attempts} retr(ies)"

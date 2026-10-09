@@ -1652,6 +1652,11 @@ class ScriptedTranslator:
 
     def translate_document_checked(self, source_text, lang):
         step = self.script.pop(0)
+        if isinstance(step, Exception):
+            self.seen.append({"model": self.site.model,
+                              "prompt_template": self.site.prompt_template,
+                              "raised": str(step)})
+            raise step
         self.seen.append({"model": self.site.model,
                           "prompt_template": self.site.prompt_template,
                           "temperature": self.site.temperature,
@@ -1748,6 +1753,48 @@ class TestTranslateWithRecovery(unittest.TestCase):
         site = _bleed_site(retry_on_verify_fail=0, fallback_model="")
         with self.assertRaises(RuntimeError):
             _run_recovery(site, [(BLED, [BLEED_PROBLEM])])
+
+    def test_chunk_structure_error_goes_to_fallback_model(self):
+        """2026-10-09: ar themeforge failed three nights on `inline code
+        29->28` raised by translate_chunk; the ladder now hands that page to
+        the fallback model instead of giving up."""
+        site = _bleed_site(retry_on_verify_fail=2,
+                           fallback_model="unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q5_K_S",
+                           fallback_prompt_template="instruct")
+        err = RuntimeError("body chunk structure mismatch after retries (inline code 29->28)")
+        out, via, seen = _run_recovery(site, [err, (CLEAN, [])])
+        self.assertEqual(out, CLEAN)
+        self.assertEqual(via, "fallback-model")
+        self.assertEqual(len(seen), 2, "no same-model retries: straight to the fallback")
+        self.assertEqual(seen[1]["model"], site.fallback_model)
+        self.assertEqual(seen[1]["prompt_template"], "instruct")
+
+    def test_non_glossary_verify_problem_goes_to_fallback_model(self):
+        site = _bleed_site(fallback_model="unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q5_K_S")
+        out, via, seen = _run_recovery(site, [(CLEAN, ["inline code: 3 -> 5"]), (CLEAN, [])])
+        self.assertEqual(via, "fallback-model")
+        self.assertEqual(seen[1]["model"], site.fallback_model)
+
+    def test_chunk_structure_error_without_fallback_raises_original(self):
+        site = _bleed_site(fallback_model="")
+        err = RuntimeError("body chunk structure mismatch after retries (inline code 29->28)")
+        with self.assertRaises(RuntimeError) as cm:
+            _run_recovery(site, [err])
+        self.assertIn("inline code 29->28", str(cm.exception))
+
+    def test_fallback_that_also_fails_raises_with_both_reasons(self):
+        site = _bleed_site(fallback_model="unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q5_K_S")
+        err = RuntimeError("body chunk structure mismatch after retries (inline code 29->28)")
+        with self.assertRaises(RuntimeError) as cm:
+            _run_recovery(site, [err, (CLEAN, ["inline code: 3 -> 4"])])
+        self.assertIn("29->28", str(cm.exception))
+        self.assertIn("fallback model also failed", str(cm.exception))
+
+    def test_other_runtime_errors_are_not_swallowed(self):
+        site = _bleed_site(fallback_model="unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q5_K_S")
+        with self.assertRaises(RuntimeError) as cm:
+            _run_recovery(site, [RuntimeError("rig exploded")])
+        self.assertEqual(str(cm.exception), "rig exploded")
 
     def test_non_glossary_failure_is_not_retried(self):
         """A code-span or link-prefix delta is deterministic: retrying it burns
