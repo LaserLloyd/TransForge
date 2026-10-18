@@ -23,7 +23,7 @@ x-common: &common
     args:
       VERSION: ${VERSION:-dev}
   init: true                      # tini as PID 1: signal forwarding + zombie reaping
-  stop_grace_period: 30s
+  stop_grace_period: 60s
   env_file:
     - path: .env
       required: false
@@ -38,6 +38,14 @@ x-common: &common
     # Opt-in `transforge review` stage: name the variable in config.toml
     # ([review] api_key_env) and pass its value through .env.
     DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+  # Non-root by default. For bind mounts owned by another UID see
+  # compose.puid.yml (starts as root only to chown, then drops to PUID:PGID).
+  user: "${RUN_AS:-1000:1000}"
+  # Everything stateful is on the config/state mounts or in /sites; the image
+  # filesystem is read-only so a stray write fails loudly.
+  read_only: true
+  tmpfs:
+    - /tmp
   cap_drop: [ALL]
   security_opt:
     - no-new-privileges:true
@@ -87,11 +95,12 @@ services:
       TRANSFORGE_INTERVAL: ${TRANSFORGE_INTERVAL:-3600}
     healthcheck:
       # The scheduler touches a heartbeat file every 30 s.
-      test: ["CMD-SHELL", "find /data/tmp/heartbeat -mmin -2 2>/dev/null | grep -q ."]
+      test: ["CMD-SHELL", "find /tmp/heartbeat -mmin -2 2>/dev/null | grep -q ."]
       start_period: 60s
       interval: 60s
       timeout: 5s
       retries: 3
 
 volumes:
+  # `docker compose down` keeps this volume; `down -v` DELETES the manifests.
   transforge-state:

@@ -79,7 +79,8 @@ COPY --chown=app:app deploy/compose/config.example.toml /usr/local/share/transfo
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    HOME=/data
+    HOME=/data \
+    IMAGE_VERSION=${VERSION}
 
 # No `VOLUME`: an unmounted anonymous volume would hide data loss.
 RUN install -d -o app -g app -m 0750 /data /data/.config /data/.config/transforge \

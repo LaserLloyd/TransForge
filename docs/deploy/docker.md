@@ -92,13 +92,75 @@ Its healthcheck watches a heartbeat file, not the translation result: a failing
 run is logged and retried at the next interval. Put the two variables in `.env`
 to make them permanent. Stop it with `... --profile schedule down`.
 
-## Data, upgrades, removal
+## Your data, upgrades, backups
+
+TransForge keeps its state in three places, all outside the image (its root
+filesystem is read-only and `/tmp` is a tmpfs, so a stray write fails loudly):
+
+| What | Where |
+|---|---|
+| `config.toml` | host directory `CONFIG_PATH` (default `deploy/compose/config`) |
+| manifests (`<site>-manifest.json`) and the backups of replaced translations | named volume `transforge-state` |
+| your translated pages | your site tree, `SITES_PATH`, written in place |
+
+| Command | Effect on your data |
+|---|---|
+| `docker compose ... down` | stops and removes the containers; **the state volume is kept** |
+| `docker compose ... down -v` | **also deletes `transforge-state`: manifests and replaced-file backups are gone** (translations in your site tree stay; TransForge then treats existing siblings as `UNTRACKED` until you run `accept`) |
+| `docker compose ... build` after `git pull` | new image, same mounts: data intact |
+
+### Upgrades
 
 ```bash
-git pull && docker compose -f deploy/compose/compose.yml build              # upgrade; mounts are kept
-docker compose -f deploy/compose/compose.yml --profile schedule down        # stop the scheduler
-docker compose -f deploy/compose/compose.yml down -v                        # also delete the state volume (manifests, backups)
+git pull
+docker compose -f deploy/compose/compose.yml build
 ```
+
+On the first start of a new image version the entrypoint copies `config.toml` and
+the manifests to `<state>/image-backups/<old>-to-<new>-<timestamp>/` (inside the
+state volume; last 5 kept). TransForge's own `<state>/backups/` (files it replaced
+while translating) is separate and untouched. The version compared is `<package
+version>-<VERSION build arg>`; pass `--build-arg VERSION=...` when building locally
+if you want a backup on every rebuild.
+
+### Back up and restore the state volume
+
+Stop the scheduler first if you use it. The volume is named
+`transforge_transforge-state` (`docker volume ls`).
+
+```bash
+docker compose -f deploy/compose/compose.yml --profile schedule stop
+docker run --rm -v transforge_transforge-state:/data:ro -v "$PWD":/backup alpine \
+    tar czf /backup/transforge-state-$(date +%F).tgz -C /data .
+```
+
+Restore (replaces the volume's contents):
+
+```bash
+docker compose -f deploy/compose/compose.yml --profile schedule down
+docker run --rm -v transforge_transforge-state:/data -v "$PWD":/backup alpine \
+    sh -c 'rm -rf /data/* /data/.[!.]* && tar xzf /backup/transforge-state-YYYY-MM-DD.tgz -C /data'
+```
+
+Back up `CONFIG_PATH` and your site tree with your usual tools (they are plain
+host directories; a site tree is normally in git anyway).
+
+### Volume permissions (bind mounts)
+
+The image runs as UID/GID 1000, so `config/` and `sites/` must be writable by it
+(the sites tree because translations are written next to the sources). A named
+volume (`transforge-state`) just works. If a bind mount belongs to someone else the
+container stops at once with a message saying so. Either `chown` it, or run as your
+user:
+
+```bash
+PUID=$(id -u) PGID=$(id -g) docker compose \
+    -f deploy/compose/compose.yml -f deploy/compose/compose.puid.yml run --rm app status --all
+```
+
+That override starts the container as root only to `chown` the config and state
+directories (never `/sites`: make your site tree writable by `PUID` yourself) and
+drop to `PUID:PGID` (`setpriv`); the app process runs with no capabilities.
 
 ## Image
 

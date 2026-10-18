@@ -66,7 +66,17 @@ Scheduled translation (optional, `restart: unless-stopped`):
 TRANSFORGE_SCHEDULE_CMD="run --site example" docker compose -f deploy/compose/compose.yml --profile schedule up -d
 ```
 
-Details, mounts and upgrades: [`docs/deploy/docker.md`](docs/deploy/docker.md).
+**Your data survives updates.** The config lives in `deploy/compose/config/`, translations in your site tree, and the manifests
+only in the `transforge-state` volume (the image is read-only). `docker compose down` keeps the volume; **`down -v` deletes the
+manifests**. A new image version copies the config and manifests into the volume's `image-backups/` on first start. Back up
+(scheduler stopped):
+
+```bash
+docker compose -f deploy/compose/compose.yml --profile schedule stop
+docker run --rm -v transforge_transforge-state:/data:ro -v "$PWD":/backup alpine tar czf /backup/transforge-state-$(date +%F).tgz -C /data .
+```
+
+Restore, bind-mount ownership (`PUID`/`PGID`), mounts and upgrades: [`docs/deploy/docker.md`](docs/deploy/docker.md).
 
 ## Config reference
 
