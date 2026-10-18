@@ -204,6 +204,9 @@ def http_refusal_message(e):
     if e.code in (401, 403):
         msg += (f" -- StudioForge requires credentials: set ${API_KEY_ENV} "
                 "(or `api_key_env` / `api_key` in the config)")
+        if str(e.url).endswith(("/load-recommended", "/unload")):
+            msg += ("; a StudioForge that predates API keys wants the "
+                    "(deprecated) STUDIOFORGE_MCP_PIN for load/unload")
     return msg
 
 
@@ -760,6 +763,8 @@ def warmup(site, rig, quiet=False):
             rig.load_recommended(site.model, site.ctx_per_slot, site.priority)
             break
         except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise     # credentials: the caller prints the hint, exit 2
             code, retry, lease, body = sf_error(e)
             if code == "gpu_leased":
                 # A benchmark lease means stand down (exit 6, same as the
@@ -1676,6 +1681,14 @@ def cmd_run(args, sites):
     rig = Rig(site)
     try:
         if args.no_warmup:
+            # --no-warmup skips the model load, not the benchmark gate: without
+            # this read the first minute of jobs (the in-run gate re-reads only
+            # every 60 s) started with no lease check at all.
+            lease = rig.bench_lease()
+            if lease:
+                print(f"rig leased by '{lease.get('holder')}' — backing off",
+                      file=sys.stderr)
+                return 6
             workers = max(1, rig.live_parallel(site.model)) if site.concurrency == "auto" \
                 else max(1, int(site.concurrency))
         else:
@@ -1718,6 +1731,7 @@ def cmd_run(args, sites):
             # fail closed: cannot read the lease list -> stop starting jobs
             with lock:
                 lease_state["stop"] = True
+                lease_state["auth"] = True
                 lease_state["holder"] = "lease list unreadable"
             print(str(e), file=sys.stderr)
             return True
@@ -1793,6 +1807,11 @@ def cmd_run(args, sites):
           + f", {results['fail']} failed, "
           f"{results['leased']} deferred (rig leased) in {dur:.0f}s "
           f"({workers} workers)")
+    if lease_state.get("auth"):
+        # the lease list became unreadable mid-run (key revoked/rotated): a
+        # credentials problem (2), not a lease to wait out (6), or a scheduler
+        # retries every interval without anyone being told to fix the key.
+        return USAGE_ERROR
     if results["fail"]:
         return 1
     return 6 if results["leased"] else 0
