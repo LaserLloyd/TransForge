@@ -41,6 +41,18 @@ class TestPuidPath(unittest.TestCase):
         for parent in ("/data", "/data/.config", "/data/.local", "/data/.local/state"):
             self.assertEqual(modes.get(parent), "0755", parent)
 
+    def test_manifest_scan_cannot_kill_the_entrypoint(self):
+        """`files="$(state_files)"` under set -e: a failing find (cwd /sites not
+        enterable by this UID) used to end the entrypoint silently, exit 1."""
+        body = read("deploy/docker-entrypoint.sh").split("state_files() {", 1)[1]
+        body = body.split("\n}", 1)[0]
+        finds = [l for l in body.splitlines() if l.strip().startswith("find ")]
+        self.assertTrue(finds)
+        for line in finds:
+            self.assertTrue(line.rstrip().endswith("|| true"), line)
+        self.assertIn("/sites", re.search(
+            r"-m 0755 ([^&]+)&&", read("Dockerfile").replace("\\\n", " ")).group(1))
+
     def test_ci_smoke_runs_the_puid_path(self):
         wf = read(".github/workflows/containers.yml")
         self.assertIn("-e PUID=1001", wf)

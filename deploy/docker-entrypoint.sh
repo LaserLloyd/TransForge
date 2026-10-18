@@ -74,7 +74,10 @@ done
 # ---- 3. pre-upgrade backup --------------------------------------------------
 state_files() {
     [ -f "$CFG" ] && echo "$CFG"
-    find "$STATE" -maxdepth 1 -type f -name '*-manifest.json' 2>/dev/null
+    # `|| true`: under `set -e` a failing find (e.g. a working directory this
+    # UID cannot enter) ended the command substitution, and with it the whole
+    # entrypoint, with exit 1 and no message.
+    find "$STATE" -maxdepth 1 -type f -name '*-manifest.json' 2>/dev/null || true
     return 0
 }
 
