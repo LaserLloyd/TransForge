@@ -178,6 +178,13 @@ def http_refusal_message(e):
     return msg
 
 
+def http_refusal_exit_code(e):
+    """Exit code for a reachable-but-refused StudioForge: 401/403 is a
+    credentials problem (USAGE_ERROR, like the lease-list refusal); anything
+    else is a failed run (1)."""
+    return USAGE_ERROR if e.code in (401, 403) else 1
+
+
 def die(msg, code=USAGE_ERROR):
     """Usage/config error: message on stderr, deterministic exit code."""
     print(msg, file=sys.stderr)
@@ -1603,7 +1610,7 @@ def cmd_run(args, sites):
     except urllib.error.HTTPError as e:
         # reachable, but the server refused: not an unreachable-rig condition
         print(http_refusal_message(e), file=sys.stderr)
-        return 1
+        return http_refusal_exit_code(e)
     except (urllib.error.URLError, OSError) as e:
         print(f"rig unreachable: {e}", file=sys.stderr)
         return 4
@@ -1980,7 +1987,7 @@ def cmd_text(args, sites):
     except urllib.error.HTTPError as e:
         # reachable, but the server refused: not an unreachable-rig condition
         print(http_refusal_message(e), file=sys.stderr)
-        return 1
+        return http_refusal_exit_code(e)
     except (urllib.error.URLError, OSError) as e:
         print(f"rig unreachable: {e}", file=sys.stderr)
         return 4
@@ -2162,6 +2169,15 @@ def main():
     except RigAuthError as e:
         print(str(e), file=sys.stderr)
         rc = USAGE_ERROR
+    except urllib.error.HTTPError as e:
+        # `models` / `warmup` talk to the rig without their own handler: a
+        # refusal is a one-line message and the documented exit code, not a
+        # traceback.
+        print(http_refusal_message(e), file=sys.stderr)
+        rc = http_refusal_exit_code(e)
+    except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
+        print(f"rig unreachable: {e}", file=sys.stderr)
+        rc = 4
     sys.exit(rc)
 
 
