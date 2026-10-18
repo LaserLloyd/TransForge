@@ -270,7 +270,7 @@ Steps 1–4 send `Authorization: Bearer <key>` on every request. Set `TRANSFORGE
 (or `STUDIOFORGE_API_KEY`, or `api_key_env` / `api_key` under `[defaults]` in the config); `transforge config`
 shows where the key came from and never prints it. Steps 3–4 additionally send the legacy management PIN as
 `X-MCP-Pin` (from `STUDIOFORGE_MCP_PIN` or the file named by `TRANSFORGE_PIN_ENV_FILE`); the PIN path is
-deprecated and will be removed after 0.2.0. A 401/403 on the lease list now stops the run (exit code 2)
+deprecated as of 0.2.0 and will be removed in the next release. A 401/403 on the lease list now stops the run (exit code 2)
 instead of reading as "no lease"; an unreachable StudioForge or a 404/5xx on the lease list behaves as before.
 
 ## Structural verification
