@@ -136,6 +136,8 @@ Site keys (only meaningful per-site):
 
 ## Manifest and staleness model
 
+Manifests written on Windows before 0.2.0 had mixed `/` and `\` keys; run `transforge accept --all` once to rebuild them.
+
 The manifest keys `<rel_source>|<lang>` → `{src_sha, out_sha, cfg, model, out,
 translated_at, duration_s}`. `cfg` is `cfg_hash()`: a hash of everything that
 changes output — model, prompt template, `no_translate`, `style`,
@@ -239,11 +241,12 @@ Worker count is the model's live `parallel` slot count when
 `concurrency = "auto"`, otherwise `min(concurrency, parallel)`. `--workers N`
 overrides it. Smaller `ctx_per_slot` generally buys more slots.
 
-Steps 3–4 need the server's management PIN, sent as `X-MCP-Pin`. It is read
-from the `STUDIOFORGE_MCP_PIN` environment variable or, if that is unset, from
-a `STUDIOFORGE_MCP_PIN=...` line in the file named by `TRANSFORGE_PIN_ENV_FILE`
-(opt-in; no file location is ever guessed). Without either TransForge warns and
-runs serially against whatever plan the server chooses.
+Steps 1–4 send `Authorization: Bearer <key>` on every request. Set `TRANSFORGE_LLM_API_KEY`
+(or `STUDIOFORGE_API_KEY`, or `api_key_env` / `api_key` under `[defaults]` in the config); `transforge config`
+shows where the key came from and never prints it. Steps 3–4 additionally send the legacy management PIN as
+`X-MCP-Pin` (from `STUDIOFORGE_MCP_PIN` or the file named by `TRANSFORGE_PIN_ENV_FILE`); the PIN path is
+deprecated and will be removed after 0.2.0. A 401/403 on the lease list now stops the run (exit code 2)
+instead of reading as "no lease"; an unreachable StudioForge or a 404/5xx on the lease list behaves as before.
 
 ## Structural verification
 
@@ -260,6 +263,8 @@ by it: `/projects/foo/` becomes `/ja/projects/foo/` only when
 `content/projects/foo.ja.md` (or `<pages_dir>/foo.ja.md`) exists on disk.
 
 ## Exit codes
+
+Exit code 2 also covers "StudioForge refused credentials or the lease list (401/403)".
 
 | Code | Meaning |
 |---|---|
