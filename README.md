@@ -31,6 +31,43 @@ skipped by discovery: no sibling is made and the page never shows up in
 `status`, `plan` or `run`. Use it for pages whose prose lives in a template
 rather than in the markdown body.
 
+## Run in Docker
+
+TransForge is a batch CLI, so the container is a toolbox run against your site tree; it needs no Python or `uv` on the host.
+
+```bash
+git clone https://github.com/LaserLloyd/TransForge.git && cd TransForge   # scrub-ok: public repo URL  (or: git pull)
+mkdir -p deploy/compose/config deploy/compose/sites && cp -r /path/to/your/site deploy/compose/sites/example
+docker compose -f deploy/compose/compose.yml run --rm app status --all
+```
+
+The first run seeds `deploy/compose/config/config.toml` (endpoint = your LLM server, one site `example` rooted at
+`/sites/example`). Edit it, then `plan`, `run --dry-run`, `run`:
+
+```bash
+docker compose -f deploy/compose/compose.yml run --rm app run --site example --limit 3
+```
+
+Siblings are written next to your sources (the site tree is mounted read-write); manifests and backups live in the
+`transforge-state` volume, so re-runs stay incremental. Optional config goes in `deploy/compose/.env` (copy `.env.example`):
+
+| Variable | Default | |
+|---|---|---|
+| `LLM_BASE_URL` | `http://host.docker.internal:1234/v1` | your StudioForge / llama.cpp server as the container sees it; seeds `endpoint` once (a trailing `/v1` is dropped) |
+| `STUDIOFORGE_MCP_PIN` | empty | management PIN for warmup / load-recommended |
+| `DEEPSEEK_API_KEY` | empty | only for the opt-in `review` stage |
+| `CONFIG_PATH` / `SITES_PATH` | `./config` / `./sites` | host paths, relative to `deploy/compose/` |
+
+**Ports:** none. TransForge only makes outbound calls to your LLM server (reach the host's server at `host.docker.internal`; it must listen on an address the container can reach).
+
+Scheduled translation (optional, `restart: unless-stopped`):
+
+```bash
+TRANSFORGE_SCHEDULE_CMD="run --site example" docker compose -f deploy/compose/compose.yml --profile schedule up -d
+```
+
+Details, mounts and upgrades: [`docs/deploy/docker.md`](docs/deploy/docker.md).
+
 ## Config reference
 
 A minimal config:
