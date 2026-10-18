@@ -37,6 +37,20 @@ skipped by discovery: no sibling is made and the page never shows up in
 `status`, `plan` or `run`. Use it for pages whose prose lives in a template
 rather than in the markdown body.
 
+## Quick start
+
+1. Install (see above): `pip install .` inside a virtual environment, or `pipx install .` / `uv tool install .`.
+2. Write the minimal config to `~/.config/transforge/config.toml` (the example under [Config reference](#config-reference): an `endpoint`, a `model`, and one `[sites.<name>]` with `root`, `content_dirs` and `languages`).
+3. Look at what needs translating, then check the rig:
+
+```bash
+transforge status --all    # reads your site tree and manifests only; never contacts the rig (exit 1 = work pending)
+transforge models          # asks the LLM server: confirms it is reachable and lists its models (exit 4 = unreachable)
+```
+
+`transforge --version` prints the installed version. `status` is offline by design; `models` is the command that
+checks the rig. Then `plan`, `run --dry-run`, `run` (see [Commands](#commands)).
+
 ## Run in Docker
 
 TransForge is a batch CLI, so the container is a toolbox run against your site tree; it needs no Python or `uv` on the host.
@@ -174,7 +188,7 @@ before being overwritten.
 ## Commands
 
 ```
-transforge status [--site X | --all] [-v]     per-language state table
+transforge status [--site X | --all] [-v]     per-language state table (offline: never contacts the rig)
 transforge plan   [--site X] [--langs ..] [--files ..] [--force]
 transforge run    [--site X] [--langs ..] [--files ..] [--force] [--dry-run]
                   [--workers N] [--no-warmup] [--limit N]
@@ -184,7 +198,7 @@ transforge text   [TEXT] --to LANG [--from LANG] [--model ID] [--json]
 transforge accept [--site X] [--langs ..] [--files ..] [--all]
 transforge verify [--site X]                  re-run structural checks on outputs
 transforge warmup [--site X]                  load the model on a sane plan
-transforge models                             rig models, with loaded plans
+transforge models                             rig models, with loaded plans (the command that checks the rig)
 transforge report [--append FILE]             one-shot text report (cron-friendly)
 transforge config [--site X]                  resolved config + cfg_hash
 transforge review [--site X] [--langs ..] [--files ..] [--dry-run]
