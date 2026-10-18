@@ -49,6 +49,7 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import posixpath
 import re
 import shutil
 import threading
@@ -161,6 +162,47 @@ def sf_error(e):
     return code, retry, lease, body
 
 
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow an HTTP redirect from the LLM server.
+
+    urllib's default handler copies EVERY request header -- `Authorization:
+    Bearer <key>` and `X-MCP-Pin` included -- onto the redirected request, to
+    whatever host the Location names. The StudioForge / OpenAI-compatible API
+    never redirects; a 3xx means a proxy in front of it (typically an SSO
+    login) or a wrong endpoint, and following it would hand the key to that
+    host and, for the lease list, read a login page as "no lease". The 3xx is
+    raised as an HTTPError instead (see Rig.leases() for how that one fails)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urllib.parse.urlsplit(newurl)
+        raise urllib.error.HTTPError(
+            req.full_url, code,
+            f"{msg} (redirect to {target.scheme}://{target.netloc} not followed; "
+            "point `endpoint` at the server itself)", headers, fp)
+
+
+_OPENER = urllib.request.build_opener(_RefuseRedirect)
+
+
+def _urlopen(req, timeout):
+    """urlopen() without redirects (credentials never leave the endpoint)."""
+    return _OPENER.open(req, timeout=timeout)
+
+
+_PIN_WARNED = []
+
+
+def _warn_pin_deprecated():
+    """Once per process, when the PIN is the ONLY credential a load/unload
+    rides on: the docs say it goes away in the next release, and an operator
+    who never reads a CHANGELOG would otherwise find out from a 401."""
+    if not _PIN_WARNED:
+        _PIN_WARNED.append(True)
+        print("warning: STUDIOFORGE_MCP_PIN (X-MCP-Pin) is deprecated and will "
+              f"be removed in the release after 0.2.0; set ${API_KEY_ENV} to a "
+              "StudioForge API key instead", file=sys.stderr)
+
+
 class RigAuthError(RuntimeError):
     """StudioForge answered 401/403 to a request whose answer we must have.
 
@@ -176,6 +218,9 @@ def http_refusal_message(e):
     if e.code in (401, 403):
         msg += (f" -- StudioForge requires credentials: set ${API_KEY_ENV} "
                 "(or `api_key_env` / `api_key` in the config)")
+        if str(e.url).endswith(("/load-recommended", "/unload")):
+            msg += ("; a StudioForge that predates API keys wants the "
+                    "(deprecated) STUDIOFORGE_MCP_PIN for load/unload")
     return msg
 
 
@@ -323,14 +368,35 @@ def pick_site(sites, name):
 
 
 # ---------------------------------------------------------------- manifest
+def manifest_key(rel_src, lang):
+    """'<rel_src>|<lang>' with rel_src '/'-separated and normalised.
+
+    The same key on every OS: discovery returns native paths (backslashes on
+    Windows), and before 0.2.0 a Windows run stored MIXED keys
+    ('content/projects\\foo.md'). Keying on the native form made every entry
+    of an older manifest -- or of one written on the other OS, e.g. a Windows
+    manifest in the Linux container -- unmatched: the pages read UNTRACKED and
+    the next status/plan/run PRUNED the entries (src_sha history included, so
+    the documented `accept --all` remedy then accepted STALE siblings as
+    current)."""
+    rel = posixpath.normpath(str(rel_src).replace("\\", "/"))
+    return f"{rel}|{lang}"
+
+
+def _canonical_key(key):
+    rel, sep, lang = str(key).rpartition("|")
+    return manifest_key(rel, lang) if sep else key
+
+
 class Manifest:
-    """entries key: '<rel_src>|<lang>' -> {src_sha, out_sha, cfg, model,
-    out, translated_at, duration_s, accepted}"""
+    """entries key: manifest_key(rel_src, lang) -> {src_sha, out_sha, cfg,
+    model, out, translated_at, duration_s, accepted}"""
 
     def __init__(self, site_name):
         os.makedirs(STATE_DIR, exist_ok=True)
         self.path = os.path.join(STATE_DIR, f"{site_name}-manifest.json")
         self.lock = threading.Lock()
+        self.migrated = 0
         if os.path.isfile(self.path):
             try:
                 with open(self.path, encoding="utf-8") as f:
@@ -339,20 +405,32 @@ class Manifest:
                 die(f"manifest is corrupt: {self.path}: {e}\n"
                     f"delete it and re-run `transforge accept --site {site_name} "
                     f"--all` to rebuild from the siblings on disk")
-            self.entries = data.get("entries", {}) if isinstance(data, dict) else {}
+            raw = data.get("entries", {}) if isinstance(data, dict) else {}
+            self.entries = {}
+            # Re-key older / other-OS manifests in place (persisted by the next
+            # save). Two spellings of one page: keep the newer entry.
+            for k, entry in (raw.items() if isinstance(raw, dict) else ()):
+                ck = _canonical_key(k)
+                if ck != k:
+                    self.migrated += 1
+                prev = self.entries.get(ck)
+                if prev is None or _entry_stamp(entry) >= _entry_stamp(prev):
+                    self.entries[ck] = entry
         else:
             self.entries = {}
 
     def get(self, rel_src, lang):
-        return self.entries.get(f"{rel_src}|{lang}")
+        return self.entries.get(manifest_key(rel_src, lang))
 
     def set(self, rel_src, lang, entry):
         with self.lock:
-            self.entries[f"{rel_src}|{lang}"] = entry
+            self.entries[manifest_key(rel_src, lang)] = entry
 
     def prune(self, valid_keys):
         """Drop entries whose source page or language no longer exists.
+        *valid_keys* are '<rel_src>|<lang>' in any separator form.
         Returns the number removed."""
+        valid_keys = {_canonical_key(k) for k in valid_keys}
         with self.lock:
             dead = [k for k in self.entries if k not in valid_keys]
             for k in dead:
@@ -364,6 +442,10 @@ class Manifest:
             write_atomic(self.path, json.dumps(
                 {"version": 1, "saved_at": now_iso(), "entries": self.entries},
                 indent=1, sort_keys=True), mode=0o600)
+
+
+def _entry_stamp(entry):
+    return str(entry.get("translated_at") or "") if isinstance(entry, dict) else ""
 
 
 # --------------------------------------------------------------- discovery
@@ -468,6 +550,8 @@ class Rig:
             p = self.pin()
             if p:
                 headers["X-MCP-Pin"] = p
+                if not key:
+                    _warn_pin_deprecated()
             elif not key:
                 raise RuntimeError(
                     f"no StudioForge credentials — export ${API_KEY_ENV} "
@@ -476,7 +560,7 @@ class Rig:
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.base + path, data=data,
                                      headers=headers, method=method)
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with _urlopen(req, timeout=timeout) as r:
             raw = r.read().decode("utf-8")
             return json.loads(raw) if raw else {}
 
@@ -530,6 +614,8 @@ class Rig:
         FAILS CLOSED when StudioForge refuses the read (HTTP 401/403): the
         lease list is how a run learns a benchmark owns the GPUs, so an auth
         refusal must stop the run (RigAuthError), never read as "no lease".
+        A redirect (3xx, not followed -- see _RefuseRedirect) fails closed
+        too: it is how an auth proxy in front of StudioForge says "log in".
 
         Deliberately still fail-OPEN for everything else -- an unreachable
         StudioForge (connection refused, DNS, timeout), a server that has no
@@ -546,6 +632,11 @@ class Rig:
                     "cannot tell whether a benchmark holds the GPUs, so not "
                     f"proceeding. Set ${API_KEY_ENV} (or `api_key_env` / "
                     "`api_key` in the config) to a valid StudioForge key.")
+            if 300 <= e.code < 400:
+                raise RigAuthError(
+                    f"the lease list answered with a redirect (HTTP {e.code} "
+                    f"{e.reason}): cannot tell whether a benchmark holds the "
+                    "GPUs, so not proceeding.")
             return []
         except Exception:
             return []      # unreachable / no such endpoint: documented above
@@ -688,6 +779,8 @@ def warmup(site, rig, quiet=False):
             rig.load_recommended(site.model, site.ctx_per_slot, site.priority)
             break
         except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise     # credentials: the caller prints the hint, exit 2
             code, retry, lease, body = sf_error(e)
             if code == "gpu_leased":
                 # A benchmark lease means stand down (exit 6, same as the
@@ -1604,6 +1697,14 @@ def cmd_run(args, sites):
     rig = Rig(site)
     try:
         if args.no_warmup:
+            # --no-warmup skips the model load, not the benchmark gate: without
+            # this read the first minute of jobs (the in-run gate re-reads only
+            # every 60 s) started with no lease check at all.
+            lease = rig.bench_lease()
+            if lease:
+                print(f"rig leased by '{lease.get('holder')}' — backing off",
+                      file=sys.stderr)
+                return 6
             workers = max(1, rig.live_parallel(site.model)) if site.concurrency == "auto" \
                 else max(1, int(site.concurrency))
         else:
@@ -1646,6 +1747,7 @@ def cmd_run(args, sites):
             # fail closed: cannot read the lease list -> stop starting jobs
             with lock:
                 lease_state["stop"] = True
+                lease_state["auth"] = True
                 lease_state["holder"] = "lease list unreadable"
             print(str(e), file=sys.stderr)
             return True
@@ -1721,6 +1823,11 @@ def cmd_run(args, sites):
           + f", {results['fail']} failed, "
           f"{results['leased']} deferred (rig leased) in {dur:.0f}s "
           f"({workers} workers)")
+    if lease_state.get("auth"):
+        # the lease list became unreadable mid-run (key revoked/rotated): a
+        # credentials problem (2), not a lease to wait out (6), or a scheduler
+        # retries every interval without anyone being told to fix the key.
+        return USAGE_ERROR
     if results["fail"]:
         return 1
     return 6 if results["leased"] else 0

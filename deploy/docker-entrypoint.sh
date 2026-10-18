@@ -48,7 +48,11 @@ if [ "$(id -u)" = "0" ]; then
         fi
     done
     mkdir -p /tmp
-    exec setpriv --reuid="$PUID" --regid="$PGID" --init-groups --inh-caps=-all -- "$0" "$@"
+    # --clear-groups, not --init-groups: the latter needs a passwd entry for
+    # PUID, and the usermod above cannot add one on the read-only root
+    # filesystem compose uses, so every PUID other than 1000 died with
+    # "setpriv: uid N not found". No supplementary groups are needed.
+    exec setpriv --reuid="$PUID" --regid="$PGID" --clear-groups --inh-caps=-all -- "$0" "$@"
 fi
 
 # ---- 2. writability --------------------------------------------------------
@@ -70,7 +74,10 @@ done
 # ---- 3. pre-upgrade backup --------------------------------------------------
 state_files() {
     [ -f "$CFG" ] && echo "$CFG"
-    find "$STATE" -maxdepth 1 -type f -name '*-manifest.json' 2>/dev/null
+    # `|| true`: under `set -e` a failing find (e.g. a working directory this
+    # UID cannot enter) ended the command substitution, and with it the whole
+    # entrypoint, with exit 1 and no message.
+    find "$STATE" -maxdepth 1 -type f -name '*-manifest.json' 2>/dev/null || true
     return 0
 }
 

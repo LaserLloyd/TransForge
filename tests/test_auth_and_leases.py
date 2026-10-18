@@ -378,5 +378,99 @@ class TestMainHandlesRigErrorsForEveryCommand(_EnvCase):
         self.assertNotIn("Traceback", err)
 
 
+class TestRedirectsAreNotFollowed(_EnvCase):
+    """urllib's default redirect handler re-sends every header (Authorization,
+    X-MCP-Pin) to whatever host Location names. The rig client must not follow
+    a redirect at all, and a redirected lease list must fail closed."""
+
+    def _front_and_back(self, front, back, path):
+        front.route("GET", path, 302, {"moved": True},
+                    headers={"Location": back.url + path})
+        back.route("GET", path, 200, {"leases": [], "data": []})
+
+    def test_bearer_key_and_pin_never_reach_the_redirect_target(self):
+        self.use_env(TRANSFORGE_LLM_API_KEY=KEY, STUDIOFORGE_MCP_PIN="1234abcd")
+        with FakeStudioForge() as front, FakeStudioForge() as back:
+            self._front_and_back(front, back, "/v1/models")
+            rig = tf.Rig(make_site(endpoint=front.url))
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                rig.models()
+            cm.exception.close()
+        self.assertEqual(cm.exception.code, 302)
+        self.assertIn("not followed", str(cm.exception.reason))
+        self.assertEqual(len(front.requests), 1)
+        self.assertEqual(back.requests, [])        # nothing, so no key either
+
+    def test_redirected_lease_list_fails_closed(self):
+        self.use_env(TRANSFORGE_LLM_API_KEY=KEY)
+        with FakeStudioForge() as front, FakeStudioForge() as back:
+            self._front_and_back(front, back, "/api/leases")
+            rig = tf.Rig(make_site(endpoint=front.url))
+            with self.assertRaises(tf.RigAuthError) as cm:
+                rig.bench_lease()
+        self.assertIn("redirect", str(cm.exception))
+        self.assertNotIn(KEY, str(cm.exception))
+        self.assertEqual(back.requests, [])
+
+    def test_cmd_text_on_a_redirecting_endpoint_exits_2_and_sends_no_chat(self):
+        self.use_env(TRANSFORGE_LLM_API_KEY=KEY)
+        with FakeStudioForge() as front, FakeStudioForge() as back:
+            self._front_and_back(front, back, "/api/leases")
+            site = make_site(endpoint=front.url, model="vendor/m", languages=["ja"])
+            args = argparse.Namespace(site="t", text="hello", to="ja", from_lang=None,
+                                      model=None, json=False, no_warmup=False)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = tf.cmd_text(args, {"t": site})
+        self.assertEqual(rc, 2)
+        self.assertEqual(back.requests, [])
+        self.assertFalse([r for r in front.requests if "chat" in r["path"]])
+
+    def test_review_client_does_not_follow_redirects_either(self):
+        if REPO not in sys.path:
+            sys.path.insert(0, REPO)
+        import review as _review
+        with FakeStudioForge() as front, FakeStudioForge() as back:
+            front.route("POST", "/v1/chat/completions", 307, {"moved": True},
+                        headers={"Location": back.url + "/v1/chat/completions"})
+            rc = mock.Mock(base_url=front.url + "/v1", model="m", temperature=0.0,
+                           max_tokens=10, reasoning_effort="", timeout_s=5)
+            rc.api_key.return_value = KEY
+            with self.assertRaises(RuntimeError) as cm:
+                _review.ReviewClient(rc)._post("s", "u", 10, "")
+        self.assertIn("HTTP 307", str(cm.exception))
+        self.assertEqual(back.requests, [])
+
+
+class TestPinDeprecationNotice(_EnvCase):
+    def _load(self, sf):
+        tf.Rig(make_site(endpoint=sf.url)).load_recommended("vendor/m", 8192, 3)
+
+    def setUp(self):
+        p = mock.patch.object(tf, "_PIN_WARNED", [])
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_pin_as_the_only_credential_warns_once(self):
+        self.use_env(STUDIOFORGE_MCP_PIN="1234abcd")
+        err = io.StringIO()
+        with FakeStudioForge() as sf, contextlib.redirect_stderr(err):
+            sf.route("POST", "/api/models/", 200, {"ok": True}, exact=False)
+            self._load(sf)
+            self._load(sf)
+        self.assertEqual(err.getvalue().count("STUDIOFORGE_MCP_PIN"), 1)
+        self.assertIn("deprecated", err.getvalue())
+        self.assertIn("TRANSFORGE_LLM_API_KEY", err.getvalue())
+        self.assertNotIn("1234abcd", err.getvalue())
+
+    def test_no_notice_when_an_api_key_is_set(self):
+        self.use_env(TRANSFORGE_LLM_API_KEY=KEY, STUDIOFORGE_MCP_PIN="1234abcd")
+        err = io.StringIO()
+        with FakeStudioForge() as sf, contextlib.redirect_stderr(err):
+            sf.route("POST", "/api/models/", 200, {"ok": True}, exact=False)
+            self._load(sf)
+        self.assertEqual(err.getvalue(), "")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -86,8 +86,14 @@ ENV PATH="/app/.venv/bin:$PATH" \
     IMAGE_VERSION=${VERSION}
 
 # No `VOLUME`: an unmounted anonymous volume would hide data loss.
-RUN install -d -o app -g app -m 0750 /data /data/.config /data/.config/transforge \
-        /data/.local /data/.local/state /data/.local/state/transforge /data/tmp /sites
+# The PARENTS of the two mount points are 0755: they hold no data, and a run as
+# another UID (compose.puid.yml, or RUN_AS) must be able to traverse them to
+# reach the mounts; 0750 owned by 1000 made /data unreachable for that UID.
+# /sites (the WORKDIR, a mount point too) likewise.
+RUN install -d -o app -g app -m 0755 /data /data/.config /data/.local /data/.local/state \
+        /sites \
+ && install -d -o app -g app -m 0750 /data/.config/transforge \
+        /data/.local/state/transforge /data/tmp
 
 WORKDIR /sites
 USER app
