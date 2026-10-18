@@ -57,6 +57,9 @@ def _is_loopback_host(host) -> bool:
 
 def _refuse(what: str):
     VIOLATIONS.append(what)
+    if os.environ.get("NETGUARD_TRACE"):      # debugging aid: who tried to connect?
+        import traceback
+        traceback.print_stack(limit=12)
     raise NetworkBlockedError(f"test network guard: refused {what}")
 
 
