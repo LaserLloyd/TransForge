@@ -48,7 +48,11 @@ if [ "$(id -u)" = "0" ]; then
         fi
     done
     mkdir -p /tmp
-    exec setpriv --reuid="$PUID" --regid="$PGID" --init-groups --inh-caps=-all -- "$0" "$@"
+    # --clear-groups, not --init-groups: the latter needs a passwd entry for
+    # PUID, and the usermod above cannot add one on the read-only root
+    # filesystem compose uses, so every PUID other than 1000 died with
+    # "setpriv: uid N not found". No supplementary groups are needed.
+    exec setpriv --reuid="$PUID" --regid="$PGID" --clear-groups --inh-caps=-all -- "$0" "$@"
 fi
 
 # ---- 2. writability --------------------------------------------------------

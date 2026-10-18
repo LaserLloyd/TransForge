@@ -110,6 +110,13 @@ jobs:
         if: env.PUBLISH != 'true'
         run: |
           docker run --rm "${{ steps.ref.outputs.image }}" --help
+          # compose.puid.yml as a UID other than 1000, on the read-only root fs
+          docker run --rm --read-only --tmpfs /tmp \
+            --tmpfs /data/.config/transforge --tmpfs /data/.local/state/transforge \
+            --cap-drop ALL --cap-add CHOWN --cap-add SETUID --cap-add SETGID \
+            --cap-add DAC_OVERRIDE --cap-add FOWNER --security-opt no-new-privileges:true \
+            --user 0:0 -e PUID=1001 -e PGID=1001 -e LLM_BASE_URL=http://127.0.0.1:9/v1 \
+            "${{ steps.ref.outputs.image }}" config
 
       # --- SBOM (syft -> CycloneDX) + checksums ---------------------------------
       - name: SBOM (CycloneDX)
