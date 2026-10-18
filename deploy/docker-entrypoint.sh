@@ -109,23 +109,22 @@ if [ "${1:-}" = "schedule" ]; then
     INTERVAL="${TRANSFORGE_INTERVAL:-3600}"
     HB=/tmp/heartbeat
     log "schedule every ${INTERVAL}s: transforge ${TRANSFORGE_SCHEDULE_CMD}"
+    # Heartbeat ticker for the compose healthcheck: runs for the life of this
+    # loop, so a translation run that takes longer than the check window does
+    # not flip the container to "unhealthy".
+    ( while :; do touch "$HB"; sleep 30; done ) &
+    TICK=$!
     CHILD=""
-    trap '[ -n "$CHILD" ] && kill "$CHILD" 2>/dev/null; exit 0' TERM INT
+    trap '[ -n "$CHILD" ] && kill "$CHILD" 2>/dev/null; kill "$TICK" 2>/dev/null; exit 0' TERM INT
     while :; do
         # shellcheck disable=SC2086  # the command is deliberately word-split
         transforge ${TRANSFORGE_SCHEDULE_CMD} &
         CHILD=$!
         wait "$CHILD" || log "scheduled run exited non-zero (will retry next interval)"
+        sleep "$INTERVAL" &
+        CHILD=$!
+        wait "$CHILD" || true
         CHILD=""
-        waited=0
-        while [ "$waited" -lt "$INTERVAL" ]; do
-            touch "$HB"
-            sleep 30 &
-            CHILD=$!
-            wait "$CHILD" || true
-            CHILD=""
-            waited=$((waited + 30))
-        done
     done
 fi
 

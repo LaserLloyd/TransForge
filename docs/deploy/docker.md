@@ -52,7 +52,8 @@ None. TransForge opens no listening socket (it is a client of your LLM server).
 | Variable | Default | Meaning |
 |---|---|---|
 | `LLM_BASE_URL` | `http://host.docker.internal:1234/v1` | Your StudioForge / llama.cpp server **as seen from the container**. TransForge has no environment variable of its own for this (it is `endpoint` in `config.toml`), so it is applied once, when the config is first seeded; a trailing `/v1` is dropped because TransForge wants the server root. Edit `endpoint` in `config.toml` afterwards. |
-| `STUDIOFORGE_MCP_PIN` | empty | StudioForge management PIN for `warmup` / `load-recommended`. Without it TransForge warns and runs serially on whatever plan the server chose. |
+| `TRANSFORGE_LLM_API_KEY` | empty | StudioForge API key, sent as `Authorization: Bearer` on every request. A 401/403 from the server stops the run with exit code 2 and a hint. |
+| `STUDIOFORGE_MCP_PIN` | empty | Legacy StudioForge management PIN for `warmup` / `load-recommended` (deprecated; not needed with an API key). Without either TransForge warns and runs serially on whatever plan the server chose. |
 | `DEEPSEEK_API_KEY` | empty | Only for the opt-in `transforge review` stage; the variable *name* must match `[review] api_key_env`. |
 | `CONFIG_PATH`, `SITES_PATH` | `./config`, `./sites` | Host paths (relative to `deploy/compose/`). |
 | `MEM_LIMIT` / `CPU_LIMIT` | `512m` / `1.0` | Resource limits. |
