@@ -26,13 +26,20 @@ PyYAML.
 Pick your platform; in each, method 1 is the simplest. TransForge is a one-shot command-line tool, so there is no service to start. It only calls
 your LLM server (the StudioForge gateway `/v1`, for example `http://localhost:1234`).
 
-Ports: none. TransForge opens no listening port; it makes outbound calls only.
+| Port | What |
+|---|---|
+| none | TransForge opens no port of its own. It only makes outbound calls to the LLM server (default `http://127.0.0.1:1234/v1`, the StudioForge **gateway**; the panel on :8080 does not serve `/v1`). |
+
+From a container, reach the host's server at `host.docker.internal`; it must listen on an address the container can reach.
 
 Needs Python 3.11 or newer; `uv` fetches one
 for you, so you rarely have to check. If the gateway requires a key, set `TRANSFORGE_LLM_API_KEY` (shown below). Never `pip install .` with the
 system Python on Debian/Ubuntu: it is refused (PEP 668), so every method below uses `uv`, `pipx` or a venv.
 
-After installing, write a config once (see "First run" below), then `transforge status --all`.
+After installing, write a config once (see "First run" below), then `transforge status --all` (offline: it reads
+your site tree and manifests and never contacts the rig; exit 1 means work is pending) and `transforge models`
+(asks the LLM server: confirms it is reachable and lists its models; exit 4 means unreachable).
+`transforge --version` prints the installed version.
 
 ### Windows
 
@@ -291,7 +298,7 @@ Docker settings in `deploy/compose/.env`:
 |---|---|---|
 | `LLM_BASE_URL` | `http://host.docker.internal:1234/v1` | your StudioForge / llama.cpp server as the container sees it; seeds `endpoint` once (a trailing `/v1` is dropped) |
 | `TRANSFORGE_LLM_API_KEY` | empty | StudioForge API key, sent as `Authorization: Bearer` on every request (see "Warmup, concurrency, leases") |
-| `STUDIOFORGE_MCP_PIN` | empty | legacy management PIN for warmup / load-recommended (deprecated; not needed with an API key) |
+| `STUDIOFORGE_MCP_PIN` | empty | legacy management PIN for warmup / load-recommended (deprecated as of 0.2.0, removed in the next release; not needed with an API key) |
 | `DEEPSEEK_API_KEY` | empty | only for the opt-in `review` stage |
 | `CONFIG_PATH` / `SITES_PATH` | `./config` / `./sites` | host paths, relative to `deploy/compose/` |
 
@@ -411,7 +418,7 @@ before being overwritten.
 ## Commands
 
 ```
-transforge status [--site X | --all] [-v]     per-language state table
+transforge status [--site X | --all] [-v]     per-language state table (offline: never contacts the rig)
 transforge plan   [--site X] [--langs ..] [--files ..] [--force]
 transforge run    [--site X] [--langs ..] [--files ..] [--force] [--dry-run]
                   [--workers N] [--no-warmup] [--limit N]
@@ -421,7 +428,7 @@ transforge text   [TEXT] --to LANG [--from LANG] [--model ID] [--json]
 transforge accept [--site X] [--langs ..] [--files ..] [--all]
 transforge verify [--site X]                  re-run structural checks on outputs
 transforge warmup [--site X]                  load the model on a sane plan
-transforge models                             rig models, with loaded plans
+transforge models                             rig models, with loaded plans (the command that checks the rig)
 transforge report [--append FILE]             one-shot text report (cron-friendly)
 transforge config [--site X]                  resolved config + cfg_hash
 transforge review [--site X] [--langs ..] [--files ..] [--dry-run]
@@ -489,7 +496,7 @@ Steps 1–4 send `Authorization: Bearer <key>` on every request. Set `TRANSFORGE
 (or `STUDIOFORGE_API_KEY`, or `api_key_env` / `api_key` under `[defaults]` in the config); `transforge config`
 shows where the key came from and never prints it. Steps 3–4 additionally send the legacy management PIN as
 `X-MCP-Pin` (from `STUDIOFORGE_MCP_PIN` or the file named by `TRANSFORGE_PIN_ENV_FILE`); the PIN path is
-deprecated and will be removed after 0.2.0. A 401/403 on the lease list now stops the run (exit code 2)
+deprecated as of 0.2.0 and will be removed in the next release. A 401/403 on the lease list now stops the run (exit code 2)
 instead of reading as "no lease"; an unreachable StudioForge or a 404/5xx on the lease list behaves as before.
 
 ## Structural verification

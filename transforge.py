@@ -46,6 +46,7 @@ import concurrent.futures
 import copy
 import datetime as _dt
 import hashlib
+import importlib.metadata
 import json
 import os
 import re
@@ -2094,9 +2095,19 @@ def cmd_config(args, sites):
 
 
 # -------------------------------------------------------------------- main
+def package_version():
+    """Installed distribution version; 'unknown' when run from a bare checkout."""
+    try:
+        return importlib.metadata.version("transforge")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
+
+
 def main():
     ap = argparse.ArgumentParser(prog="transforge", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version",
+                    version=f"transforge {package_version()}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(p, langs=True, files=False):

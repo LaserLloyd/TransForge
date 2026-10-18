@@ -1900,3 +1900,27 @@ class TestPinSource(unittest.TestCase):
             fresh = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(fresh)
         self.assertEqual(fresh.PIN_ENV_FILE, "")
+
+
+class TestVersionFlag(unittest.TestCase):
+    def _run(self):
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv", ["transforge", "--version"]),              contextlib.redirect_stdout(out),              self.assertRaises(SystemExit) as cm:
+            tf.main()
+        return cm.exception.code, out.getvalue()
+
+    def test_prints_package_metadata_version_and_exits_0(self):
+        with mock.patch.object(tf.importlib.metadata, "version",
+                               return_value="9.8.7"):
+            code, text = self._run()
+        self.assertEqual(code, 0)
+        self.assertEqual(text.strip(), "transforge 9.8.7")
+
+    def test_falls_back_when_not_installed(self):
+        with mock.patch.object(
+                tf.importlib.metadata, "version",
+                side_effect=tf.importlib.metadata.PackageNotFoundError("transforge")):
+            code, text = self._run()
+        self.assertEqual(code, 0)
+        self.assertEqual(text.strip(), "transforge unknown")
+
