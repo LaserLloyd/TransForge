@@ -60,7 +60,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
 ### Deprecated
 - `X-MCP-Pin` on model load/unload (`STUDIOFORGE_MCP_PIN`,
   `TRANSFORGE_PIN_ENV_FILE`). Still sent when available; to be removed in the
-  release after 0.2.0. Use the API key instead.
+  release after 0.2.0. Use the API key instead. A load/unload that rides on
+  the PIN alone prints a one-time deprecation warning on stderr.
 
 ## 0.1.0
 - Initial release.

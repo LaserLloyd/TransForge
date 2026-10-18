@@ -189,6 +189,20 @@ def _urlopen(req, timeout):
     return _OPENER.open(req, timeout=timeout)
 
 
+_PIN_WARNED = []
+
+
+def _warn_pin_deprecated():
+    """Once per process, when the PIN is the ONLY credential a load/unload
+    rides on: the docs say it goes away in the next release, and an operator
+    who never reads a CHANGELOG would otherwise find out from a 401."""
+    if not _PIN_WARNED:
+        _PIN_WARNED.append(True)
+        print("warning: STUDIOFORGE_MCP_PIN (X-MCP-Pin) is deprecated and will "
+              f"be removed in the release after 0.2.0; set ${API_KEY_ENV} to a "
+              "StudioForge API key instead", file=sys.stderr)
+
+
 class RigAuthError(RuntimeError):
     """StudioForge answered 401/403 to a request whose answer we must have.
 
@@ -536,6 +550,8 @@ class Rig:
             p = self.pin()
             if p:
                 headers["X-MCP-Pin"] = p
+                if not key:
+                    _warn_pin_deprecated()
             elif not key:
                 raise RuntimeError(
                     f"no StudioForge credentials — export ${API_KEY_ENV} "

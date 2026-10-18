@@ -442,5 +442,35 @@ class TestRedirectsAreNotFollowed(_EnvCase):
         self.assertEqual(back.requests, [])
 
 
+class TestPinDeprecationNotice(_EnvCase):
+    def _load(self, sf):
+        tf.Rig(make_site(endpoint=sf.url)).load_recommended("vendor/m", 8192, 3)
+
+    def setUp(self):
+        p = mock.patch.object(tf, "_PIN_WARNED", [])
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_pin_as_the_only_credential_warns_once(self):
+        self.use_env(STUDIOFORGE_MCP_PIN="1234abcd")
+        err = io.StringIO()
+        with FakeStudioForge() as sf, contextlib.redirect_stderr(err):
+            sf.route("POST", "/api/models/", 200, {"ok": True}, exact=False)
+            self._load(sf)
+            self._load(sf)
+        self.assertEqual(err.getvalue().count("STUDIOFORGE_MCP_PIN"), 1)
+        self.assertIn("deprecated", err.getvalue())
+        self.assertIn("TRANSFORGE_LLM_API_KEY", err.getvalue())
+        self.assertNotIn("1234abcd", err.getvalue())
+
+    def test_no_notice_when_an_api_key_is_set(self):
+        self.use_env(TRANSFORGE_LLM_API_KEY=KEY, STUDIOFORGE_MCP_PIN="1234abcd")
+        err = io.StringIO()
+        with FakeStudioForge() as sf, contextlib.redirect_stderr(err):
+            sf.route("POST", "/api/models/", 200, {"ok": True}, exact=False)
+            self._load(sf)
+        self.assertEqual(err.getvalue(), "")
+
+
 if __name__ == "__main__":
     unittest.main()
