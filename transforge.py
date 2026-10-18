@@ -338,7 +338,9 @@ def discover_sources(site):
                 continue
             if _opts_out(os.path.join(full, fn)):
                 continue
-            out.append(os.path.join(d, fn))
+            # normpath: content_dirs are written with '/', and on Windows a bare
+            # join would give mixed separators that never match --files specs.
+            out.append(os.path.normpath(os.path.join(d, fn)))
     return out
 
 
