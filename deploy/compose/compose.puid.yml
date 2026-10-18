@@ -1,0 +1,22 @@
+# Optional override: bind mounts (config/, sites/) owned by a UID other than 1000.
+#
+#   PUID=$(id -u) PGID=$(id -g) \
+#   docker compose -f deploy/compose/compose.yml -f deploy/compose/compose.puid.yml run --rm app status --all
+#
+# The container starts as root, chowns the config and state directories to
+# PUID:PGID (never /sites - that is your site tree, so make it writable by
+# PUID yourself), then drops to that user with setpriv before the app runs. The
+# capabilities needed for that are added back here and nowhere else; the app
+# process itself ends up with none.
+x-puid: &puid
+  user: "0:0"
+  environment:
+    PUID: ${PUID:-1000}
+    PGID: ${PGID:-1000}
+  cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER]
+
+services:
+  app:
+    <<: *puid
+  schedule:
+    <<: *puid

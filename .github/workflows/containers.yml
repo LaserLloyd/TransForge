@@ -1,0 +1,163 @@
+name: containers
+
+# Build the container image on every push and pull request; on a version tag
+# (v*) also push it to GHCR, sign it, and attach provenance and an SBOM.
+#
+#   ghcr.io/laserlloyd/transforge:<version>   (and :latest on a release tag)
+#
+# Nothing here runs until the workflow is pushed to GitHub. GHCR package
+# visibility (public/private) is an owner decision made once in the package
+# settings; the first tag push creates the package private.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - deploy/**
+      - pyproject.toml
+      - uv.lock
+      - transforge.py
+      - review.py
+      - .github/workflows/containers.yml
+  workflow_dispatch:
+
+concurrency:
+  group: containers-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/laserlloyd/transforge
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    name: build / sign / attest
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write        # attach SBOM + SHA256SUMS to the release on a tag
+      packages: write        # push to GHCR
+      id-token: write        # cosign keyless + attestations (OIDC)
+      attestations: write    # actions/attest-build-provenance
+    env:
+      PUBLISH: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-qemu-action@v3
+        if: env.PUBLISH == 'true'
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata (tags + OCI labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+          # :latest only for a release tag, never for a branch build.
+          flavor: latest=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      # Branch / PR builds: one platform, loaded locally, never pushed.
+      # Tag builds: amd64 + arm64, pushed.
+      - name: Build (and push on a tag)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ env.PUBLISH == 'true' }}
+          load: ${{ env.PUBLISH != 'true' }}
+          platforms: ${{ env.PUBLISH == 'true' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            REVISION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # SBOM and provenance are produced below with syft / the GitHub
+          # attestation service, so buildx's own copies are switched off.
+          sbom: false
+          provenance: false
+
+      # What to scan: the pushed digest on a tag, else the locally loaded tag.
+      - name: Resolve image reference
+        id: ref
+        run: |
+          if [ "$PUBLISH" = "true" ]; then
+            echo "image=$IMAGE@${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "image=$IMAGE:sha-$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Smoke test the built image
+        if: env.PUBLISH != 'true'
+        run: |
+          docker run --rm "${{ steps.ref.outputs.image }}" --help
+
+      # --- SBOM (syft -> CycloneDX) + checksums ---------------------------------
+      - name: SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.ref.outputs.image }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          upload-artifact: false
+
+      - name: SHA256SUMS
+        run: sha256sum sbom.cdx.json > SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-and-checksums
+          path: |
+            sbom.cdx.json
+            SHA256SUMS
+
+      # --- everything below is tag-only ------------------------------------------
+      - name: Install cosign
+        if: env.PUBLISH == 'true'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign the image (cosign, keyless)
+        if: env.PUBLISH == 'true'
+        run: cosign sign --yes "$IMAGE@${{ steps.build.outputs.digest }}"
+
+      - name: Attach the SBOM to the image (cosign attest, keyless)
+        if: env.PUBLISH == 'true'
+        run: |
+          cosign attest --yes --type cyclonedx \
+            --predicate sbom.cdx.json "$IMAGE@${{ steps.build.outputs.digest }}"
+
+      - name: Build provenance attestation
+        if: env.PUBLISH == 'true'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attach SBOM + SHA256SUMS to the GitHub release
+        if: env.PUBLISH == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
+          gh release upload "$GITHUB_REF_NAME" sbom.cdx.json SHA256SUMS --clobber

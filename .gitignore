@@ -7,3 +7,10 @@ __pycache__/
 # never be committed, or the words that must not be published are published.
 scripts/scrub-rules.local.txt
 *.egg-info/
+
+# container deploy: local config, site trees and secrets never ship
+.env
+.env.*
+!.env.example
+deploy/compose/config/
+deploy/compose/sites/

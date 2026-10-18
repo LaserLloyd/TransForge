@@ -1,0 +1,7 @@
+# Container files run inside Linux: a Windows checkout must never turn them
+# into CRLF (a CRLF shebang makes the entrypoint fail with "not found").
+*.sh text eol=lf
+Dockerfile text eol=lf
+.dockerignore text eol=lf
+deploy/** text eol=lf
+.github/workflows/containers.yml text eol=lf

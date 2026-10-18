@@ -1,0 +1,18 @@
+# TransForge config for the container. Seeded to ./config/config.toml on first
+# start. The server URL is the Docker HOST's StudioForge / llama.cpp server -
+# inside a container "localhost" is the container itself.
+#
+# Paths under /sites are the container side of the SITES_PATH bind mount.
+
+[defaults]
+endpoint = "@ENDPOINT@"
+model = "publisher/repo/file-stem"        # full StudioForge model id; `transforge models` lists them
+
+[sites.example]
+root = "/sites/example"
+content_dirs = ["content/projects", "content/pages"]
+languages = ["ja", "de"]
+lang_names = { ja = "Japanese", de = "German" }
+link_dirs = ["projects"]
+no_translate = []
+translate_fields = ["title", "excerpt"]
