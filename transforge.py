@@ -49,6 +49,7 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import posixpath
 import re
 import shutil
 import threading
@@ -350,14 +351,35 @@ def pick_site(sites, name):
 
 
 # ---------------------------------------------------------------- manifest
+def manifest_key(rel_src, lang):
+    """'<rel_src>|<lang>' with rel_src '/'-separated and normalised.
+
+    The same key on every OS: discovery returns native paths (backslashes on
+    Windows), and before 0.2.0 a Windows run stored MIXED keys
+    ('content/projects\\foo.md'). Keying on the native form made every entry
+    of an older manifest -- or of one written on the other OS, e.g. a Windows
+    manifest in the Linux container -- unmatched: the pages read UNTRACKED and
+    the next status/plan/run PRUNED the entries (src_sha history included, so
+    the documented `accept --all` remedy then accepted STALE siblings as
+    current)."""
+    rel = posixpath.normpath(str(rel_src).replace("\\", "/"))
+    return f"{rel}|{lang}"
+
+
+def _canonical_key(key):
+    rel, sep, lang = str(key).rpartition("|")
+    return manifest_key(rel, lang) if sep else key
+
+
 class Manifest:
-    """entries key: '<rel_src>|<lang>' -> {src_sha, out_sha, cfg, model,
-    out, translated_at, duration_s, accepted}"""
+    """entries key: manifest_key(rel_src, lang) -> {src_sha, out_sha, cfg,
+    model, out, translated_at, duration_s, accepted}"""
 
     def __init__(self, site_name):
         os.makedirs(STATE_DIR, exist_ok=True)
         self.path = os.path.join(STATE_DIR, f"{site_name}-manifest.json")
         self.lock = threading.Lock()
+        self.migrated = 0
         if os.path.isfile(self.path):
             try:
                 with open(self.path, encoding="utf-8") as f:
@@ -366,20 +388,32 @@ class Manifest:
                 die(f"manifest is corrupt: {self.path}: {e}\n"
                     f"delete it and re-run `transforge accept --site {site_name} "
                     f"--all` to rebuild from the siblings on disk")
-            self.entries = data.get("entries", {}) if isinstance(data, dict) else {}
+            raw = data.get("entries", {}) if isinstance(data, dict) else {}
+            self.entries = {}
+            # Re-key older / other-OS manifests in place (persisted by the next
+            # save). Two spellings of one page: keep the newer entry.
+            for k, entry in (raw.items() if isinstance(raw, dict) else ()):
+                ck = _canonical_key(k)
+                if ck != k:
+                    self.migrated += 1
+                prev = self.entries.get(ck)
+                if prev is None or _entry_stamp(entry) >= _entry_stamp(prev):
+                    self.entries[ck] = entry
         else:
             self.entries = {}
 
     def get(self, rel_src, lang):
-        return self.entries.get(f"{rel_src}|{lang}")
+        return self.entries.get(manifest_key(rel_src, lang))
 
     def set(self, rel_src, lang, entry):
         with self.lock:
-            self.entries[f"{rel_src}|{lang}"] = entry
+            self.entries[manifest_key(rel_src, lang)] = entry
 
     def prune(self, valid_keys):
         """Drop entries whose source page or language no longer exists.
+        *valid_keys* are '<rel_src>|<lang>' in any separator form.
         Returns the number removed."""
+        valid_keys = {_canonical_key(k) for k in valid_keys}
         with self.lock:
             dead = [k for k in self.entries if k not in valid_keys]
             for k in dead:
@@ -391,6 +425,10 @@ class Manifest:
             write_atomic(self.path, json.dumps(
                 {"version": 1, "saved_at": now_iso(), "entries": self.entries},
                 indent=1, sort_keys=True), mode=0o600)
+
+
+def _entry_stamp(entry):
+    return str(entry.get("translated_at") or "") if isinstance(entry, dict) else ""
 
 
 # --------------------------------------------------------------- discovery

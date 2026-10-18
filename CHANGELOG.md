@@ -45,9 +45,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
   mount and shipped the previous code. `[tool.uv] cache-keys` now includes the
   two source files and the builder reinstalls the project on every build.
 - On Windows, discovered page paths are normalised (`os.path.normpath`), so
-  `--files content/projects/foo.md` matches and manifest keys no longer mix `/`
-  and `\`. Manifests written by an earlier Windows run used mixed separators;
-  re-run `transforge accept --site <name> --all` once to rebuild them.
+  `--files content/projects/foo.md` matches.
+- Manifest keys are `/`-separated on every OS. Keys from an earlier Windows run
+  (mixed `/` and `\`), backslash keys and `./`-prefixed keys are re-keyed on
+  load with their history; they used to read as UNTRACKED, get pruned by the
+  next `status`/`plan`/`run`, and the suggested `accept --all` then recorded
+  STALE siblings as current.
+- The LLM client no longer follows HTTP redirects: urllib re-sent the bearer
+  key and the PIN to whatever host a 3xx named. A redirected lease list now
+  fails closed (exit 2), like a 401/403.
 - The test suite is platform-aware (path separators, POSIX file modes) and is
   green on Windows (221 pre-existing tests, 11 previously failing).
 

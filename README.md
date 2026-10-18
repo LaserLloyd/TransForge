@@ -387,7 +387,7 @@ Site keys (only meaningful per-site):
 
 ## Manifest and staleness model
 
-Manifests written on Windows before 0.2.0 had mixed `/` and `\` keys; run `transforge accept --site <name> --all` once per site to rebuild them.
+Manifest keys use `/` on every OS, so a manifest moves between Windows, Linux and the container unchanged. Older spellings (the mixed `/` and `\` keys a Windows run wrote before 0.2.0, backslash keys, `./content/...`) are re-keyed with their history when the manifest is read, so `STALE` pages stay `STALE`. Do not run `accept --all` to "rebuild" an old manifest: it records every existing sibling as current, stale ones included.
 
 The manifest keys `<rel_source>|<lang>` → `{src_sha, out_sha, cfg, model, out,
 translated_at, duration_s}`. `cfg` is `cfg_hash()`: a hash of everything that
