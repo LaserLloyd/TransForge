@@ -60,3 +60,23 @@ jobs:
         run: ruff check --select E9,F .
       - name: Run tests
         run: python3 -m unittest discover -s tests
+
+  unittest-windows:
+    # Windows is the reference platform for the maintainer's rig, so it gets its
+    # own job. Same command as above; the suite is platform-aware (path
+    # separators, POSIX file modes) rather than skipped.
+    needs: privacy
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: pip install pyyaml
+      - name: Run tests
+        run: python -m unittest discover -s tests

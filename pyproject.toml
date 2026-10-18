@@ -1,6 +1,6 @@
 [project]
 name = "transforge"
-version = "0.1.0"
+version = "0.2.0"
 description = "Config-driven website translator running against a local LLM server"
 readme = "README.md"
 license = { text = "MIT" }

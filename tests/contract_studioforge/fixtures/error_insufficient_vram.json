@@ -1,0 +1,12 @@
+{
+  "_note": "derived from client code (transforge.py Rig.chat / warmup: never retried)",
+  "http_status": 507,
+  "headers": {},
+  "body": {
+    "error": {
+      "code": "insufficient_vram",
+      "message": "the model does not fit",
+      "studioforge": {"retry_after_s": null}
+    }
+  }
+}

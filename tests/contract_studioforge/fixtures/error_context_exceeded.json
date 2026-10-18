@@ -1,0 +1,8 @@
+{
+  "_note": "derived from client code (transforge.py Rig.chat: never retried)",
+  "http_status": 400,
+  "headers": {},
+  "body": {
+    "error": {"code": "context_exceeded", "message": "prompt longer than the slot context"}
+  }
+}
