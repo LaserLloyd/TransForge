@@ -12,20 +12,296 @@ Two files: `transforge.py` (the CLI) and `review.py` (the optional review
 stage, loaded from the same directory). Requires Python 3.11+ (`tomllib`) and
 PyYAML.
 
-```bash
-git clone https://github.com/LaserLloyd/TransForge   # scrub-ok: public repo URL
-cd TransForge
-python3 -m venv ~/.local/share/transforge-venv && ~/.local/share/transforge-venv/bin/pip install .
-ln -s ~/.local/share/transforge-venv/bin/transforge ~/.local/bin/transforge   # or add the venv's bin to PATH
+## Install
+
+Pick your platform; in each, method 1 is the simplest. TransForge is a one-shot command-line tool, so there is no service to start. It only calls
+your LLM server (the StudioForge gateway `/v1`, for example `http://localhost:1234`).
+
+Ports: none. TransForge opens no listening port; it makes outbound calls only.
+
+Needs Python 3.11 or newer; `uv` fetches one
+for you, so you rarely have to check. If the gateway requires a key, set `TRANSFORGE_LLM_API_KEY` (shown below). Never `pip install .` with the
+system Python on Debian/Ubuntu: it is refused (PEP 668), so every method below uses `uv`, `pipx` or a venv.
+
+After installing, write a config once (see "First run" below), then `transforge status --all`.
+
+### Windows
+
+Run the blocks in PowerShell. After a `winget install`, close and reopen PowerShell.
+
+#### 1. `uv tool install` (simplest)
+
+Choose this to get a `transforge` command on `PATH` with no clone and no venv to manage.
+
+```powershell
+winget install --id Git.Git -e --source winget
+winget install --id astral-sh.uv -e --source winget
+# close and reopen PowerShell, then:
+uv tool install --python 3.13 git+https://github.com/LaserLloyd/TransForge   # scrub-ok: public repo URL
+uv tool update-shell        # puts uv's tool folder on PATH; close and reopen PowerShell if it says so
+transforge --help
 ```
 
-A plain `pip install .` works inside any virtual environment or with `pipx install .`
-/ `uv tool install .`; on Debian/Ubuntu it is refused outside one
-(`externally-managed-environment`, PEP 668), and a bare `ubuntu:24.04` first needs
-`apt install python3 python3-venv`. Windows: `py -m venv .venv && .venv\Scripts\pip install .`.
+| Pros | Cons |
+|---|---|
+| One command; `transforge` is on `PATH` in every folder | Needs git for the first fetch, and uv |
+| uv fetches Python 3.13 itself and keeps the tool in its own venv | To edit the code, use method 2 |
+| Upgrade and remove with one command each | `PATH` takes one `update-shell` plus a new window |
 
-Or run it in place by symlinking `transforge.py` onto your PATH; `review.py` is
-found next to the symlink's target.
+#### 2. venv from a clone
+
+Choose this to edit the code or when you prefer plain `pip`.
+
+```powershell
+winget install --id Git.Git -e --source winget
+winget install --id Python.Python.3.12 -e --source winget
+# close and reopen PowerShell, then:
+git clone https://github.com/LaserLloyd/TransForge.git   # scrub-ok: public repo URL
+cd TransForge
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install .
+.\.venv\Scripts\transforge.exe --help
+```
+
+Run it as `.\.venv\Scripts\transforge.exe ...` from the clone, or add `...\TransForge\.venv\Scripts` to `PATH`. Use `pip install -e .` to edit in place.
+
+| Pros | Cons |
+|---|---|
+| Plain tools: Python, pip, git | The command is not on `PATH` until you add it |
+| Editable with `pip install -e .` | Most steps; you manage Python and updates |
+
+#### 3. Docker Desktop
+
+Choose this when you do not want Python on the machine. The config lives in a folder you edit, the manifests on a Docker volume.
+
+```powershell
+winget install --id Git.Git -e --source winget
+winget install --id Docker.DockerDesktop -e --source winget
+# start Docker Desktop once and wait until it says the engine is running, then:
+git clone https://github.com/LaserLloyd/TransForge.git   # scrub-ok: public repo URL
+cd TransForge
+New-Item -ItemType Directory -Force deploy\compose\config, deploy\compose\sites | Out-Null
+Copy-Item -Recurse C:\path\to\your\site deploy\compose\sites\example     # or set SITES_PATH in deploy\compose\.env
+Copy-Item deploy\compose\.env.example deploy\compose\.env
+# optional: edit deploy\compose\.env (LLM_BASE_URL, TRANSFORGE_LLM_API_KEY); the default is http://host.docker.internal:1234/v1
+docker compose -f deploy/compose/compose.yml run --rm app status --all
+```
+
+The first run writes `deploy\compose\config\config.toml`; edit it (see "First run"), then run `... run --rm app models`.
+
+| Pros | Cons |
+|---|---|
+| No Python; read-only, non-root image | Docker Desktop is a large install |
+| Manifests on a named volume that survives upgrades | Site roots in `config.toml` are container paths (`/sites/example`) |
+| Optional `schedule` profile re-runs a command on an interval | The LLM server on the host must accept connections from the container, not only on the host's `127.0.0.1` |
+
+### Linux
+
+Blocks assume Ubuntu or Debian (apt). A bare Ubuntu image has no `git` or `curl`, so the first line installs them.
+
+#### 1. `uv tool install` (simplest)
+
+Choose this to get a `transforge` command on `PATH` with no clone and no venv to manage.
+
+```bash
+sudo apt-get update && sudo apt-get install -y git curl ca-certificates
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env
+uv tool install --python 3.13 git+https://github.com/LaserLloyd/TransForge   # scrub-ok: public repo URL
+transforge --help
+```
+
+| Pros | Cons |
+|---|---|
+| One command after uv; no PEP 668 error; `transforge` is on `PATH` | Needs git and uv |
+| uv fetches Python 3.13 itself, so an old system Python does not matter | To edit the code, use method 3 |
+| Upgrade and remove with one command each | New shells need `$HOME/.local/bin` on `PATH` (the uv installer adds it to your profile) |
+
+#### 2. `pipx`
+
+Choose this if you already use pipx and your system Python is 3.11 or newer (Ubuntu 24.04 and Debian 12 are; Ubuntu 22.04 ships 3.10, so use method 1).
+
+```bash
+sudo apt-get update && sudo apt-get install -y git pipx
+pipx ensurepath
+export PATH="$HOME/.local/bin:$PATH"
+pipx install git+https://github.com/LaserLloyd/TransForge   # scrub-ok: public repo URL
+transforge --help
+```
+
+| Pros | Cons |
+|---|---|
+| Isolated venv, command on `PATH`, no PEP 668 error | Uses your system Python, which must be 3.11 or newer |
+| Plain apt packages | `pipx ensurepath` needs a new shell to take effect |
+
+#### 3. venv from a clone
+
+Choose this to edit the code.
+
+```bash
+sudo apt-get update && sudo apt-get install -y git python3-venv
+git clone https://github.com/LaserLloyd/TransForge.git && cd TransForge   # scrub-ok: public repo URL
+python3 -m venv ~/.local/share/transforge-venv
+~/.local/share/transforge-venv/bin/pip install .
+mkdir -p ~/.local/bin && ln -sf ~/.local/share/transforge-venv/bin/transforge ~/.local/bin/transforge
+export PATH="$HOME/.local/bin:$PATH"
+transforge --help
+```
+
+| Pros | Cons |
+|---|---|
+| Plain tools: Python, pip, git; `pip install -e .` to edit in place | Most steps; you manage Python and updates |
+| The clone is the source of truth for your changes | System Python must be 3.11 or newer |
+
+#### 4. Docker Compose
+
+Choose this when you do not want Python on the machine. The config lives in a folder you edit, the manifests on a Docker volume.
+
+```bash
+sudo apt-get update && sudo apt-get install -y git docker.io docker-compose-v2
+sudo usermod -aG docker $USER      # log out and in once, or prefix the docker lines below with sudo
+git clone https://github.com/LaserLloyd/TransForge.git && cd TransForge   # scrub-ok: public repo URL
+mkdir -p deploy/compose/config deploy/compose/sites
+cp -r /path/to/your/site deploy/compose/sites/example      # or set SITES_PATH in deploy/compose/.env
+sudo chown -R 1000:1000 deploy/compose/config deploy/compose/sites     # the image runs as UID 1000
+cp deploy/compose/.env.example deploy/compose/.env
+# optional: edit deploy/compose/.env (LLM_BASE_URL, TRANSFORGE_LLM_API_KEY); the default is http://host.docker.internal:1234/v1
+docker compose -f deploy/compose/compose.yml run --rm app status --all
+```
+
+The first run writes `deploy/compose/config/config.toml`; edit it (see "First run"), then run `... run --rm app models`. Translations are written next to your
+sources in `deploy/compose/sites/`, so copy them back or point `SITES_PATH` at your real site tree (it must be writable by UID 1000, or use `compose.puid.yml`).
+
+| Pros | Cons |
+|---|---|
+| No Python; read-only, non-root image | Needs a Docker engine; config and site paths need the UID 1000 step |
+| Manifests on a named volume that survives upgrades | Site roots in `config.toml` are container paths (`/sites/example`) |
+| Optional `schedule` profile re-runs a command on an interval | The LLM server on the host must listen on an address the container can reach |
+
+### macOS
+
+The tool is plain Python with one dependency (PyYAML), so nothing is macOS-specific.
+
+#### 1. `uv tool install` (simplest)
+
+```bash
+brew install git uv
+uv tool install --python 3.13 git+https://github.com/LaserLloyd/TransForge   # scrub-ok: public repo URL
+uv tool update-shell        # then open a new Terminal window
+transforge --help
+```
+
+| Pros | Cons |
+|---|---|
+| One command after Homebrew; no clone | Needs Homebrew (<https://brew.sh>) |
+
+#### 2. Docker Desktop
+
+Same files and steps as Linux method 4, with Docker Desktop in place of the engine and no `chown` line:
+
+```bash
+brew install git
+brew install --cask docker     # then open Docker Desktop once and wait for "Engine running"
+git clone https://github.com/LaserLloyd/TransForge.git && cd TransForge   # scrub-ok: public repo URL
+mkdir -p deploy/compose/config deploy/compose/sites
+cp -r /path/to/your/site deploy/compose/sites/example
+cp deploy/compose/.env.example deploy/compose/.env
+docker compose -f deploy/compose/compose.yml run --rm app status --all
+```
+
+| Pros | Cons |
+|---|---|
+| No Python | Docker Desktop is a large install |
+
+### First run (native installs)
+
+TransForge reads `~/.config/transforge/config.toml` (on Windows `%USERPROFILE%\.config\transforge\config.toml`) and refuses to start without it.
+Write a minimal one, point `endpoint` at the gateway root (no `/v1`), and set `model` to a full StudioForge model id (`transforge models` lists them).
+
+```bash
+mkdir -p ~/.config/transforge
+cat > ~/.config/transforge/config.toml <<'EOF'
+[defaults]
+endpoint = "http://localhost:1234"
+model = "publisher/repo/file-stem"
+
+[sites.example]
+root = "~/sites/example"
+content_dirs = ["content/projects", "content/pages"]
+languages = ["ja", "de"]
+lang_names = { ja = "Japanese", de = "German" }
+link_dirs = ["projects"]
+no_translate = []
+translate_fields = ["title", "excerpt"]
+EOF
+export TRANSFORGE_LLM_API_KEY=...       # only if the gateway requires a key
+transforge config                        # resolved config; offline
+transforge models                        # what the server offers
+transforge run --site example --dry-run
+```
+
+PowerShell:
+
+```powershell
+New-Item -ItemType Directory -Force $HOME\.config\transforge | Out-Null
+[IO.File]::WriteAllText("$HOME\.config\transforge\config.toml", @'
+[defaults]
+endpoint = "http://localhost:1234"
+model = "publisher/repo/file-stem"
+
+[sites.example]
+root = "~/sites/example"
+content_dirs = ["content/projects", "content/pages"]
+languages = ["ja", "de"]
+lang_names = { ja = "Japanese", de = "German" }
+link_dirs = ["projects"]
+no_translate = []
+translate_fields = ["title", "excerpt"]
+'@)
+$env:TRANSFORGE_LLM_API_KEY = "..."      # this window only; setx TRANSFORGE_LLM_API_KEY "..." keeps it
+transforge config
+```
+
+### Upgrade and uninstall
+
+- **`uv tool`:** `uv tool install --reinstall git+https://github.com/LaserLloyd/TransForge` upgrades (rollback: add `@<tag or commit>` to the URL);   <!-- scrub-ok: public repo URL -->
+  `uv tool uninstall transforge` removes it.
+- **`pipx`:** `pipx install --force git+https://github.com/LaserLloyd/TransForge` upgrades; `pipx uninstall transforge` removes it.   <!-- scrub-ok: public repo URL -->
+- **venv from a clone:** `git pull` and `pip install .` again with the venv's pip; uninstall = delete the venv and the clone.
+- **Docker:** `git pull` then `docker compose -f deploy/compose/compose.yml build`; roll back with `git checkout` of the earlier commit and the same `build`.
+  `docker compose ... down` keeps the `transforge-state` volume; **`down -v` deletes the manifests** (translations stay, but TransForge then treats existing
+  siblings as `UNTRACKED` until you run `transforge accept`). On the first start of a new image version the config and manifests are copied to
+  `image-backups/` in the volume (last 5 kept).
+
+Uninstalling the program never touches your data: the config (`~/.config/transforge/`), the manifests and backups (`~/.local/state/transforge/`) and your
+translated pages stay. Delete the first two yourself only if you are done with the site; the manifests are what protect hand-edited translations.
+
+Docker settings in `deploy/compose/.env`:
+
+| Variable | Default | |
+|---|---|---|
+| `LLM_BASE_URL` | `http://host.docker.internal:1234/v1` | your StudioForge / llama.cpp server as the container sees it; seeds `endpoint` once (a trailing `/v1` is dropped) |
+| `TRANSFORGE_LLM_API_KEY` | empty | StudioForge API key, sent as `Authorization: Bearer` on every request (see "Warmup, concurrency, leases") |
+| `STUDIOFORGE_MCP_PIN` | empty | legacy management PIN for warmup / load-recommended (deprecated; not needed with an API key) |
+| `DEEPSEEK_API_KEY` | empty | only for the opt-in `review` stage |
+| `CONFIG_PATH` / `SITES_PATH` | `./config` / `./sites` | host paths, relative to `deploy/compose/` |
+
+Scheduled translation in Docker (optional, `restart: unless-stopped`):
+
+```bash
+TRANSFORGE_SCHEDULE_CMD="run --site example" docker compose -f deploy/compose/compose.yml --profile schedule up -d
+```
+
+Back up the state volume (scheduler stopped):
+
+```bash
+docker compose -f deploy/compose/compose.yml --profile schedule stop
+docker run --rm -v transforge_transforge-state:/data:ro -v "$PWD":/backup alpine tar czf /backup/transforge-state-$(date +%F).tgz -C /data .
+```
+
+Restore, bind-mount ownership (`PUID`/`PGID`), mounts and upgrades: [`docs/deploy/docker.md`](docs/deploy/docker.md).
+
+## Files and naming
 
 - Config: `~/.config/transforge/config.toml`
 - State: `~/.local/state/transforge/` — `<site>-manifest.json`, `backups/<site>/<stamp>/`
@@ -36,54 +312,6 @@ A source page whose frontmatter sets `en_only: true` or `translate: false` is
 skipped by discovery: no sibling is made and the page never shows up in
 `status`, `plan` or `run`. Use it for pages whose prose lives in a template
 rather than in the markdown body.
-
-## Run in Docker
-
-TransForge is a batch CLI, so the container is a toolbox run against your site tree; it needs no Python or `uv` on the host.
-
-```bash
-git clone https://github.com/LaserLloyd/TransForge.git && cd TransForge   # scrub-ok: public repo URL  (or: git pull)
-mkdir -p deploy/compose/config deploy/compose/sites && cp -r /path/to/your/site deploy/compose/sites/example
-docker compose -f deploy/compose/compose.yml run --rm app status --all
-```
-
-The first run seeds `deploy/compose/config/config.toml` (endpoint = your LLM server, one site `example` rooted at
-`/sites/example`). Edit it, then `plan`, `run --dry-run`, `run`:
-
-```bash
-docker compose -f deploy/compose/compose.yml run --rm app run --site example --limit 3
-```
-
-Siblings are written next to your sources (the site tree is mounted read-write); manifests and backups live in the
-`transforge-state` volume, so re-runs stay incremental. Optional config goes in `deploy/compose/.env` (copy `.env.example`):
-
-| Variable | Default | |
-|---|---|---|
-| `LLM_BASE_URL` | `http://host.docker.internal:1234/v1` | your StudioForge / llama.cpp server as the container sees it; seeds `endpoint` once (a trailing `/v1` is dropped) |
-| `TRANSFORGE_LLM_API_KEY` | empty | StudioForge API key, sent as `Authorization: Bearer` on every request (see "Warmup, concurrency, leases") |
-| `STUDIOFORGE_MCP_PIN` | empty | legacy management PIN for warmup / load-recommended (deprecated; not needed with an API key) |
-| `DEEPSEEK_API_KEY` | empty | only for the opt-in `review` stage |
-| `CONFIG_PATH` / `SITES_PATH` | `./config` / `./sites` | host paths, relative to `deploy/compose/` |
-
-**Ports:** none. TransForge only makes outbound calls to your LLM server (reach the host's server at `host.docker.internal`; it must listen on an address the container can reach).
-
-Scheduled translation (optional, `restart: unless-stopped`):
-
-```bash
-TRANSFORGE_SCHEDULE_CMD="run --site example" docker compose -f deploy/compose/compose.yml --profile schedule up -d
-```
-
-**Your data survives updates.** The config lives in `deploy/compose/config/`, translations in your site tree, and the manifests
-only in the `transforge-state` volume (the image is read-only). `docker compose down` keeps the volume; **`down -v` deletes the
-manifests**. A new image version copies the config and manifests into the volume's `image-backups/` on first start. Back up
-(scheduler stopped):
-
-```bash
-docker compose -f deploy/compose/compose.yml --profile schedule stop
-docker run --rm -v transforge_transforge-state:/data:ro -v "$PWD":/backup alpine tar czf /backup/transforge-state-$(date +%F).tgz -C /data .
-```
-
-Restore, bind-mount ownership (`PUID`/`PGID`), mounts and upgrades: [`docs/deploy/docker.md`](docs/deploy/docker.md).
 
 ## Config reference
 
