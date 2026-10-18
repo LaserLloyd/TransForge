@@ -38,6 +38,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
   to unhealthy while a run takes longer than two minutes.
 - README: the install section explains the virtual-environment requirement on
   Debian/Ubuntu (PEP 668) and the Windows equivalent.
+
+### Fixed
+- Docker: a rebuild after a source-only change (`transforge.py` / `review.py`
+  edited, version unchanged) reused uv's cached wheel from the build-cache
+  mount and shipped the previous code. `[tool.uv] cache-keys` now includes the
+  two source files and the builder reinstalls the project on every build.
 - On Windows, discovered page paths are normalised (`os.path.normpath`), so
   `--files content/projects/foo.md` matches and manifest keys no longer mix `/`
   and `\`. Manifests written by an earlier Windows run used mixed separators;

@@ -33,9 +33,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-install-project --no-editable
 
 # README.md because pyproject.toml names it as the package readme.
+# --reinstall-package transforge: never serve the project itself from the uv
+# cache mount (belt and braces next to [tool.uv] cache-keys in pyproject.toml;
+# a source-only change used to produce an image with the previous code).
 COPY README.md LICENSE transforge.py review.py ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-editable
+    uv sync --locked --no-editable --reinstall-package transforge
 
 RUN find /app/.venv -name '__pycache__' -type d -prune -exec rm -rf {} + \
  && find /app/.venv -name '*.pyc' -delete
