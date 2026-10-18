@@ -296,6 +296,87 @@ class TestHttpRefusalHint(unittest.TestCase):
         self.assertIn("TRANSFORGE_LLM_API_KEY", tf.http_refusal_message(e401))
         self.assertNotIn("TRANSFORGE_LLM_API_KEY", tf.http_refusal_message(e500))
 
+    def test_401_and_403_map_to_exit_2_other_refusals_to_1(self):
+        for code, rc in ((401, 2), (403, 2), (404, 1), (500, 1)):
+            e = urllib.error.HTTPError("http://x/v1/models", code, "x", None, None)
+            self.assertEqual(tf.http_refusal_exit_code(e), rc, code)
+
+
+class TestRefusedElsewhereThanLeases(_EnvCase):
+    """README: exit 2 = 'StudioForge refused credentials'. That must hold when
+    the 401 arrives on /v1/models or /api/status, not only on /api/leases."""
+
+    def _text_args(self):
+        return argparse.Namespace(site="t", text="hello", to="ja", from_lang=None,
+                                  model=None, json=False, no_warmup=False)
+
+    def test_cmd_text_401_on_models_exits_2(self):
+        self.use_env()
+        with FakeStudioForge() as sf:
+            sf.route("GET", "/api/leases", 200, {"leases": []})
+            sf.route("GET", "/v1/models", 401, {"error": {"code": "unauthorized"}})
+            site = make_site(endpoint=sf.url, model="vendor/m", languages=["ja"])
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = tf.cmd_text(self._text_args(), {"t": site})
+        self.assertEqual(rc, 2)
+        self.assertIn("TRANSFORGE_LLM_API_KEY", err.getvalue())
+        self.assertFalse([r for r in sf.requests if "chat" in r["path"]])
+
+    def test_cmd_text_500_on_models_still_exits_1(self):
+        self.use_env()
+        with FakeStudioForge() as sf:
+            sf.route("GET", "/api/leases", 200, {"leases": []})
+            sf.route("GET", "/v1/models", 500, {"error": {"code": "boom"}})
+            site = make_site(endpoint=sf.url, model="vendor/m", languages=["ja"])
+            with contextlib.redirect_stderr(io.StringIO()):
+                rc = tf.cmd_text(self._text_args(), {"t": site})
+        self.assertEqual(rc, 1)
+
+
+class TestMainHandlesRigErrorsForEveryCommand(_EnvCase):
+    """`models` and `warmup` have no handler of their own: main() must still
+    turn an unreachable or refusing StudioForge into the documented exit code
+    and one line on stderr, never a traceback."""
+
+    def _main(self, site, *argv):
+        err = io.StringIO()
+        with mock.patch.object(tf, "load_config", lambda: ({}, {"t": site})), \
+                mock.patch.object(sys, "argv", ["transforge", *argv]), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err), \
+                self.assertRaises(SystemExit) as cm:
+            tf.main()
+        return cm.exception.code, err.getvalue()
+
+    def _dead_port(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
+    def test_models_and_warmup_unreachable_exit_4(self):
+        self.use_env()
+        site = make_site(endpoint=f"http://127.0.0.1:{self._dead_port()}", model="vendor/m")
+        for argv in (("models",), ("warmup", "--site", "t")):
+            with self.subTest(argv=argv):
+                code, err = self._main(site, *argv)
+                self.assertEqual(code, 4)
+                self.assertIn("rig unreachable", err)
+                self.assertNotIn("Traceback", err)
+
+    def test_models_401_exits_2_with_the_hint(self):
+        self.use_env()
+        with FakeStudioForge() as sf:
+            sf.route("GET", "/api/status", 401, {"error": {"code": "unauthorized"}})
+            sf.route("GET", "/v1/models", 401, {"error": {"code": "unauthorized"}})
+            code, err = self._main(make_site(endpoint=sf.url), "models")
+        self.assertEqual(code, 2)
+        self.assertIn("HTTP 401", err)
+        self.assertIn("TRANSFORGE_LLM_API_KEY", err)
+        self.assertNotIn("Traceback", err)
+
 
 if __name__ == "__main__":
     unittest.main()

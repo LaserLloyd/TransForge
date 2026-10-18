@@ -15,8 +15,14 @@ PyYAML.
 ```bash
 git clone https://github.com/LaserLloyd/TransForge   # scrub-ok: public repo URL
 cd TransForge
-pip install .        # puts `transforge` on your PATH
+python3 -m venv ~/.local/share/transforge-venv && ~/.local/share/transforge-venv/bin/pip install .
+ln -s ~/.local/share/transforge-venv/bin/transforge ~/.local/bin/transforge   # or add the venv's bin to PATH
 ```
+
+A plain `pip install .` works inside any virtual environment or with `pipx install .`
+/ `uv tool install .`; on Debian/Ubuntu it is refused outside one
+(`externally-managed-environment`, PEP 668), and a bare `ubuntu:24.04` first needs
+`apt install python3 python3-venv`. Windows: `py -m venv .venv && .venv\Scripts\pip install .`.
 
 Or run it in place by symlinking `transforge.py` onto your PATH; `review.py` is
 found next to the symlink's target.
@@ -54,7 +60,8 @@ Siblings are written next to your sources (the site tree is mounted read-write);
 | Variable | Default | |
 |---|---|---|
 | `LLM_BASE_URL` | `http://host.docker.internal:1234/v1` | your StudioForge / llama.cpp server as the container sees it; seeds `endpoint` once (a trailing `/v1` is dropped) |
-| `STUDIOFORGE_MCP_PIN` | empty | management PIN for warmup / load-recommended |
+| `TRANSFORGE_LLM_API_KEY` | empty | StudioForge API key, sent as `Authorization: Bearer` on every request (see "Warmup, concurrency, leases") |
+| `STUDIOFORGE_MCP_PIN` | empty | legacy management PIN for warmup / load-recommended (deprecated; not needed with an API key) |
 | `DEEPSEEK_API_KEY` | empty | only for the opt-in `review` stage |
 | `CONFIG_PATH` / `SITES_PATH` | `./config` / `./sites` | host paths, relative to `deploy/compose/` |
 
@@ -136,7 +143,7 @@ Site keys (only meaningful per-site):
 
 ## Manifest and staleness model
 
-Manifests written on Windows before 0.2.0 had mixed `/` and `\` keys; run `transforge accept --all` once to rebuild them.
+Manifests written on Windows before 0.2.0 had mixed `/` and `\` keys; run `transforge accept --site <name> --all` once per site to rebuild them.
 
 The manifest keys `<rel_source>|<lang>` → `{src_sha, out_sha, cfg, model, out,
 translated_at, duration_s}`. `cfg` is `cfg_hash()`: a hash of everything that
@@ -264,13 +271,11 @@ by it: `/projects/foo/` becomes `/ja/projects/foo/` only when
 
 ## Exit codes
 
-Exit code 2 also covers "StudioForge refused credentials or the lease list (401/403)".
-
 | Code | Meaning |
 |---|---|
 | 0 | Success / nothing to do |
-| 1 | Translation or verification failures (also `status` when work is pending) |
-| 2 | Usage or config error |
+| 1 | Translation or verification failures (also `status` when work is pending; also any HTTP refusal other than 401/403) |
+| 2 | Usage or config error; also StudioForge answered 401/403 (missing or wrong API key) on any request, including the lease list |
 | 4 | Rig unreachable |
 | 5 | Configured model not present on the rig |
 | 6 | Rig leased by a benchmark holder — some or all jobs deferred |

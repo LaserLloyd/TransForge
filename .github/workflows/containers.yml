@@ -11,7 +11,7 @@ name: containers
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]   # the repo's default branch is master (as ci.yml)
     tags: ["v*"]
   pull_request:
     paths:

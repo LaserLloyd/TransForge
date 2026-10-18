@@ -27,7 +27,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
   missing `/api/leases` (404) or a 5xx still read as "no lease" (documented in
   `Rig.leases`).
 - Model load/unload no longer requires a PIN when an API key is configured.
-- 401/403 responses print a hint naming `TRANSFORGE_LLM_API_KEY`.
+- 401/403 responses print a hint naming `TRANSFORGE_LLM_API_KEY` and exit with
+  code 2 on every request (not only the lease list); other HTTP refusals keep
+  exit code 1.
+- `models` and `warmup` report an unreachable StudioForge as `rig unreachable`
+  (exit code 4) and a refusal as one line (exit 1/2) instead of a traceback.
+- Docker: `TRANSFORGE_LLM_API_KEY` is passed through to the container
+  (compose, `.env.example`, docs); the `schedule` service's heartbeat keeps
+  ticking during a long translation run, so the healthcheck no longer flips
+  to unhealthy while a run takes longer than two minutes.
+- README: the install section explains the virtual-environment requirement on
+  Debian/Ubuntu (PEP 668) and the Windows equivalent.
+
+### Fixed
+- Docker: a rebuild after a source-only change (`transforge.py` / `review.py`
+  edited, version unchanged) reused uv's cached wheel from the build-cache
+  mount and shipped the previous code. `[tool.uv] cache-keys` now includes the
+  two source files and the builder reinstalls the project on every build.
 - On Windows, discovered page paths are normalised (`os.path.normpath`), so
   `--files content/projects/foo.md` matches and manifest keys no longer mix `/`
   and `\`. Manifests written by an earlier Windows run used mixed separators;
