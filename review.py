@@ -207,7 +207,8 @@ class ReviewClient:
             req = urllib.request.Request(self.url, data=req_body,
                                          headers=headers, method="POST")
             try:
-                with urllib.request.urlopen(req, timeout=self.rc.timeout_s) as r:
+                # no redirects: the bearer key must never follow a Location elsewhere
+                with tfmod._urlopen(req, timeout=self.rc.timeout_s) as r:
                     data = json.loads(r.read().decode("utf-8"))
                 u = data.get("usage") or {}
                 self.usage["prompt_tokens"] += int(u.get("prompt_tokens") or 0)

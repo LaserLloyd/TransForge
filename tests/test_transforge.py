@@ -1269,7 +1269,7 @@ class TestRigChatRequestBuilding(unittest.TestCase):
                 "choices": [{"message": {"content": "hola"},
                             "finish_reason": "stop"}]})
 
-        with mock.patch.object(tf.urllib.request, "urlopen", fake_urlopen):
+        with mock.patch.object(tf, "_urlopen", fake_urlopen):
             data = rig.chat([{"role": "user", "content": "hi"}], 100, site.temperature)
         self.assertEqual(data["choices"][0]["message"]["content"], "hola")
         body = captured["body"]

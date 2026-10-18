@@ -161,6 +161,33 @@ def sf_error(e):
     return code, retry, lease, body
 
 
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow an HTTP redirect from the LLM server.
+
+    urllib's default handler copies EVERY request header -- `Authorization:
+    Bearer <key>` and `X-MCP-Pin` included -- onto the redirected request, to
+    whatever host the Location names. The StudioForge / OpenAI-compatible API
+    never redirects; a 3xx means a proxy in front of it (typically an SSO
+    login) or a wrong endpoint, and following it would hand the key to that
+    host and, for the lease list, read a login page as "no lease". The 3xx is
+    raised as an HTTPError instead (see Rig.leases() for how that one fails)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urllib.parse.urlsplit(newurl)
+        raise urllib.error.HTTPError(
+            req.full_url, code,
+            f"{msg} (redirect to {target.scheme}://{target.netloc} not followed; "
+            "point `endpoint` at the server itself)", headers, fp)
+
+
+_OPENER = urllib.request.build_opener(_RefuseRedirect)
+
+
+def _urlopen(req, timeout):
+    """urlopen() without redirects (credentials never leave the endpoint)."""
+    return _OPENER.open(req, timeout=timeout)
+
+
 class RigAuthError(RuntimeError):
     """StudioForge answered 401/403 to a request whose answer we must have.
 
@@ -476,7 +503,7 @@ class Rig:
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.base + path, data=data,
                                      headers=headers, method=method)
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with _urlopen(req, timeout=timeout) as r:
             raw = r.read().decode("utf-8")
             return json.loads(raw) if raw else {}
 
@@ -530,6 +557,8 @@ class Rig:
         FAILS CLOSED when StudioForge refuses the read (HTTP 401/403): the
         lease list is how a run learns a benchmark owns the GPUs, so an auth
         refusal must stop the run (RigAuthError), never read as "no lease".
+        A redirect (3xx, not followed -- see _RefuseRedirect) fails closed
+        too: it is how an auth proxy in front of StudioForge says "log in".
 
         Deliberately still fail-OPEN for everything else -- an unreachable
         StudioForge (connection refused, DNS, timeout), a server that has no
@@ -546,6 +575,11 @@ class Rig:
                     "cannot tell whether a benchmark holds the GPUs, so not "
                     f"proceeding. Set ${API_KEY_ENV} (or `api_key_env` / "
                     "`api_key` in the config) to a valid StudioForge key.")
+            if 300 <= e.code < 400:
+                raise RigAuthError(
+                    f"the lease list answered with a redirect (HTTP {e.code} "
+                    f"{e.reason}): cannot tell whether a benchmark holds the "
+                    "GPUs, so not proceeding.")
             return []
         except Exception:
             return []      # unreachable / no such endpoint: documented above
