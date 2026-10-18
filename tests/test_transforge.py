@@ -15,6 +15,10 @@ import tempfile
 import unittest
 from unittest import mock
 
+import _netguard
+
+_netguard.install(strict_exit=True)  # hermetic: no real sockets
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _spec = importlib.util.spec_from_file_location(
     "transforge_mod", os.path.join(REPO, "transforge.py"))
@@ -32,6 +36,23 @@ def write(path, text):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
+
+
+def P(rel):
+    """A relative page path in the platform's native separator.  TransForge keys
+    its manifest and prints plans with os.path.join() output, so on Windows the
+    separator is a backslash; the tests compare against this, not a literal."""
+    return os.path.normpath(rel)
+
+
+POSIX_MODES = os.name != "nt"
+
+
+def ABS(rel):
+    """An absolute path that is valid on this platform ('/a/site' on POSIX,
+    '<drive>:\\a\\site' on Windows -- a bare '/a' has no drive on Windows and
+    would not round-trip through abspath())."""
+    return os.path.abspath(os.path.join(os.path.abspath(os.sep), *rel.split("/")))   # chmod modes are only meaningful on POSIX
 
 
 # ------------------------------------------------------------ frontmatter
@@ -286,8 +307,10 @@ class TestManifest(unittest.TestCase):
         m = tf.Manifest("site1")
         m.set("a.md", "ja", {"src_sha": "s"})
         m.save()
-        mode = stat.S_IMODE(os.stat(m.path).st_mode)
-        self.assertEqual(mode, 0o600)
+        self.assertTrue(os.path.isfile(m.path))
+        if POSIX_MODES:   # Windows has no POSIX mode bits; the profile ACL applies
+            mode = stat.S_IMODE(os.stat(m.path).st_mode)
+            self.assertEqual(mode, 0o600)
         self.assertFalse(os.path.exists(m.path + ".tmp"))
 
     def test_prune_drops_unknown_keys(self):
@@ -391,9 +414,9 @@ class TestDiscovery(unittest.TestCase):
 
     def test_skips_language_siblings_and_non_pages(self):
         self.assertEqual(tf.discover_sources(self.site), [
-            "content/projects/bar.html",
-            "content/projects/foo.md",
-            "content/pages/about.md",
+            P("content/projects/bar.html"),
+            P("content/projects/foo.md"),
+            P("content/pages/about.md"),
         ])
 
     def test_missing_dir_is_skipped_silently(self):
@@ -454,7 +477,10 @@ class TestMisc(unittest.TestCase):
             p = os.path.join(d, "f.md")
             tf.write_atomic(p, "hello")
             self.assertEqual(tf.read_text(p), "hello")
-            self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o644)
+            if POSIX_MODES:   # chmod bits do not exist on Windows
+                self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o644)
+            else:
+                self.assertTrue(os.access(p, os.R_OK | os.W_OK))
             self.assertFalse(os.path.exists(p + ".tmp"))
 
     def test_site_defaults_applied(self):
@@ -684,23 +710,23 @@ class TestLinkDirEscaping(unittest.TestCase):
 # ------------------------------------------------------------ path helpers
 class TestUnderRoot(unittest.TestCase):
     def test_descendant(self):
-        self.assertTrue(tf.under_root("/a/site/content/x.md", "/a/site"))
+        self.assertTrue(tf.under_root(ABS("a/site/content/x.md"), ABS("a/site")))
 
     def test_same_path(self):
-        self.assertTrue(tf.under_root("/a/site", "/a/site"))
+        self.assertTrue(tf.under_root(ABS("a/site"), ABS("a/site")))
 
     def test_prefix_sibling_is_not_under_root(self):
-        self.assertFalse(tf.under_root("/a/site-backup/x.md", "/a/site"))
+        self.assertFalse(tf.under_root(ABS("a/site-backup/x.md"), ABS("a/site")))
 
     def test_trailing_slash_root(self):
-        self.assertTrue(tf.under_root("/a/site/x.md", "/a/site/"))
+        self.assertTrue(tf.under_root(ABS("a/site/x.md"), ABS("a/site") + os.sep))
 
     def test_normalize_files_rejects_prefix_sibling(self):
-        site = make_site(root="/a/site")
-        self.assertEqual(tf.normalize_files(site, ["/a/site/content/x.md"]),
-                         ["content/x.md"])
-        self.assertEqual(tf.normalize_files(site, ["/a/site-backup/content/x.md"]),
-                         ["/a/site-backup/content/x.md"])
+        site = make_site(root=ABS("a/site"))
+        self.assertEqual(tf.normalize_files(site, [ABS("a/site/content/x.md")]),
+                         [P("content/x.md")])
+        other = ABS("a/site-backup/content/x.md")
+        self.assertEqual(tf.normalize_files(site, [other]), [other])
 
 
 # --------------------------------------------------------- manifest prune
@@ -1243,7 +1269,7 @@ class TestRigChatRequestBuilding(unittest.TestCase):
                 "choices": [{"message": {"content": "hola"},
                             "finish_reason": "stop"}]})
 
-        with mock.patch.object(tf.urllib.request, "urlopen", fake_urlopen):
+        with mock.patch.object(tf, "_urlopen", fake_urlopen):
             data = rig.chat([{"role": "user", "content": "hi"}], 100, site.temperature)
         self.assertEqual(data["choices"][0]["message"]["content"], "hola")
         body = captured["body"]
@@ -1289,6 +1315,9 @@ class FakeCliRig:
 
     def pin(self):
         return "unused-test-pin"
+
+    def api_key(self):
+        return ""
 
     def unload(self, model_id):
         raise AssertionError("unload() should not be reached in these tests")
@@ -1539,22 +1568,22 @@ class TestResolveFiles(unittest.TestCase):
 
     def test_relative_path(self):
         self.assertEqual(tf.resolve_files(self.site, ["content/projects/foo.md"]),
-                         ["content/projects/foo.md"])
+                         [P("content/projects/foo.md")])
 
     def test_absolute_path(self):
         p = os.path.join(self.root, "content/projects/foo.md")
-        self.assertEqual(tf.resolve_files(self.site, [p]), ["content/projects/foo.md"])
+        self.assertEqual(tf.resolve_files(self.site, [p]), [P("content/projects/foo.md")])
 
     def test_bare_slug(self):
-        self.assertEqual(tf.resolve_files(self.site, ["foo"]), ["content/projects/foo.md"])
+        self.assertEqual(tf.resolve_files(self.site, ["foo"]), [P("content/projects/foo.md")])
 
     def test_bare_filename(self):
-        self.assertEqual(tf.resolve_files(self.site, ["foo.md"]), ["content/projects/foo.md"])
+        self.assertEqual(tf.resolve_files(self.site, ["foo.md"]), [P("content/projects/foo.md")])
 
     def test_duplicates_collapse(self):
         self.assertEqual(
             tf.resolve_files(self.site, ["foo", "content/projects/foo.md"]),
-            ["content/projects/foo.md"])
+            [P("content/projects/foo.md")])
 
     def test_unmatched_exits_2(self):
         err = io.StringIO()
@@ -1605,7 +1634,7 @@ class TestResolveFiles(unittest.TestCase):
                          content_dirs=["content/projects", "content/pages"],
                          languages=["ja"], lang_names={"ja": "Japanese"})
         self.assertEqual(tf.resolve_files(site, ["content/pages/foo.md"]),
-                         ["content/pages/foo.md"])
+                         [P("content/pages/foo.md")])
 
     def test_plan_accepts_files_and_scopes_the_plan(self):
         """`plan --files` must actually filter, not accept-and-ignore."""
@@ -1619,8 +1648,8 @@ class TestResolveFiles(unittest.TestCase):
             with contextlib.redirect_stdout(out):
                 rc = tf.cmd_plan(args, {"t": self.site})
             self.assertEqual(rc, 0)
-            self.assertIn("content/projects/foo.md", out.getvalue())
-            self.assertNotIn("content/projects/bar.md", out.getvalue())
+            self.assertIn(P("content/projects/foo.md"), out.getvalue())
+            self.assertNotIn(P("content/projects/bar.md"), out.getvalue())
             self.assertIn("1 job(s)", out.getvalue())
 
     def test_plan_with_unmatched_files_exits_2_not_zero_jobs(self):
@@ -1871,3 +1900,27 @@ class TestPinSource(unittest.TestCase):
             fresh = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(fresh)
         self.assertEqual(fresh.PIN_ENV_FILE, "")
+
+
+class TestVersionFlag(unittest.TestCase):
+    def _run(self):
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv", ["transforge", "--version"]),              contextlib.redirect_stdout(out),              self.assertRaises(SystemExit) as cm:
+            tf.main()
+        return cm.exception.code, out.getvalue()
+
+    def test_prints_package_metadata_version_and_exits_0(self):
+        with mock.patch.object(tf.importlib.metadata, "version",
+                               return_value="9.8.7"):
+            code, text = self._run()
+        self.assertEqual(code, 0)
+        self.assertEqual(text.strip(), "transforge 9.8.7")
+
+    def test_falls_back_when_not_installed(self):
+        with mock.patch.object(
+                tf.importlib.metadata, "version",
+                side_effect=tf.importlib.metadata.PackageNotFoundError("transforge")):
+            code, text = self._run()
+        self.assertEqual(code, 0)
+        self.assertEqual(text.strip(), "transforge unknown")
+

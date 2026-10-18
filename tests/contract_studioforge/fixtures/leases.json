@@ -1,0 +1,15 @@
+{
+  "_note": "derived from client code (transforge.py _is_bench_lease, Rig.leases): GET /api/leases",
+  "response": {
+    "leases": [
+      {"id": "l-render", "holder": "clawforge", "holder_family": "clawforge", "kind": "render", "devices": [0, 1]},
+      {"id": "l-bench", "holder": "crucibleforge", "holder_family": "crucibleforge", "kind": "benchmark", "devices": [2, 3]},
+      {"id": "l-judge", "holder": "crucibleforge-judge", "holder_family": "crucibleforge", "kind": "benchmark", "devices": [2]}
+    ]
+  },
+  "legacy_records_without_kind_or_family": [
+    {"holder": "crucibleforge"},
+    {"holder": "crucibleforge-judge"}
+  ],
+  "expect_benchmark_ids": ["l-bench", "l-judge"]
+}

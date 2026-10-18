@@ -1,6 +1,6 @@
 [project]
 name = "transforge"
-version = "0.1.0"
+version = "0.2.0"
 description = "Config-driven website translator running against a local LLM server"
 readme = "README.md"
 license = { text = "MIT" }
@@ -16,3 +16,10 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 py-modules = ["transforge", "review"]
+
+[tool.uv]
+# uv caches the built wheel of this project and, by default, only invalidates
+# it when pyproject.toml / setup.py / setup.cfg change. The Dockerfile keeps
+# that cache in a persistent build mount, so without these keys an image
+# rebuilt after a source-only change (same version) shipped the OLD code.
+cache-keys = [{ file = "pyproject.toml" }, { file = "transforge.py" }, { file = "review.py" }]

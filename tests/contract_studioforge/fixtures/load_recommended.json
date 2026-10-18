@@ -1,0 +1,7 @@
+{
+  "_note": "derived from client code (Rig.load_recommended): POST /api/models/{url-quoted id}/load-recommended",
+  "model_id": "vendor/repo-GGUF/model-Q5_K_S",
+  "expect_path": "/api/models/vendor%2Frepo-GGUF%2Fmodel-Q5_K_S/load-recommended",
+  "request_body": {"ctx_size": 16384, "priority": 3},
+  "response": {"ok": true, "plan": {"parallel": 3, "ctx_per_slot": 16384}}
+}

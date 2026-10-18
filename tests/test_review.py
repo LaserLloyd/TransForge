@@ -10,6 +10,10 @@ import tempfile
 import types
 import unittest
 
+import _netguard
+
+_netguard.install(strict_exit=True)  # hermetic: no real sockets
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 

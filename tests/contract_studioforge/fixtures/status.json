@@ -1,0 +1,11 @@
+{
+  "_note": "derived from client code (Rig.loaded_row / live_parallel / cmd_models): GET /api/status",
+  "response": {
+    "version": "future-version-string",
+    "loaded": [
+      {"model_id": "vendor/repo-GGUF/model-Q5_K_S", "state": "ready", "loaded_by": "transforge",
+       "plan": {"parallel": 3, "ctx_per_slot": 16384, "ctx_size": 49152}}
+    ],
+    "clients": {"transforge": {"requests": 1}}
+  }
+}

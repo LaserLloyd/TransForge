@@ -1,0 +1,12 @@
+{
+  "_note": "derived from client code (transforge.py Rig.chat retry branch)",
+  "http_status": 503,
+  "headers": {"Retry-After": "7"},
+  "body": {
+    "error": {
+      "code": "priority_hold",
+      "message": "a higher-priority tenant holds admission",
+      "studioforge": {"retry_after_s": 7}
+    }
+  }
+}

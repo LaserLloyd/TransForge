@@ -1,0 +1,110 @@
+# TransForge - Docker Compose
+#
+# TransForge is a batch CLI, not a daemon. The default `app` service is the
+# toolbox you run commands in; the optional `schedule` service re-runs one
+# command on an interval and is the only part with restart: unless-stopped.
+#
+#   mkdir -p deploy/compose/config deploy/compose/sites     # (Linux: chown 1000:1000 both)
+#   cp -r /path/to/your/site deploy/compose/sites/example   # or set SITES_PATH in .env
+#   cp deploy/compose/.env.example deploy/compose/.env
+#   docker compose -f deploy/compose/compose.yml run --rm app status --all
+#   docker compose -f deploy/compose/compose.yml run --rm app run --site example --dry-run
+#
+#   # optional: translate on a schedule
+#   TRANSFORGE_SCHEDULE_CMD="run --site example" \
+#     docker compose -f deploy/compose/compose.yml --profile schedule up -d
+name: transforge
+
+x-common: &common
+  image: ${IMAGE:-transforge:local}
+  build:
+    context: ../..
+    dockerfile: Dockerfile
+    args:
+      VERSION: ${VERSION:-dev}
+  init: true                      # tini as PID 1: signal forwarding + zombie reaping
+  stop_grace_period: 60s
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    TZ: ${TZ:-UTC}
+    # Seeds config.toml's `endpoint` on first start (TransForge has no env var
+    # of its own for it). Your StudioForge / llama.cpp server on the host.
+    LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:1234/v1}
+    # StudioForge API key, sent as `Authorization: Bearer` on every request.
+    # Prefer the env file (chmod 0600) over putting the value on a command line.
+    TRANSFORGE_LLM_API_KEY: ${TRANSFORGE_LLM_API_KEY:-}
+    # Legacy StudioForge management PIN for warmup/load-recommended
+    # (deprecated; not needed when an API key is set).
+    STUDIOFORGE_MCP_PIN: ${STUDIOFORGE_MCP_PIN:-}
+    # Opt-in `transforge review` stage: name the variable in config.toml
+    # ([review] api_key_env) and pass its value through .env.
+    DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+  # Non-root by default. For bind mounts owned by another UID see
+  # compose.puid.yml (starts as root only to chown, then drops to PUID:PGID).
+  user: "${RUN_AS:-1000:1000}"
+  # Everything stateful is on the config/state mounts or in /sites; the image
+  # filesystem is read-only so a stray write fails loudly.
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  # Resolve host.docker.internal on Linux engines too (Docker Desktop has it).
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  volumes:
+    - ${CONFIG_PATH:-./config}:/data/.config/transforge
+    - ${SITES_PATH:-./sites}:/sites
+    # manifests + backups: this is what makes re-runs incremental and keeps
+    # hand-edited translations safe. Do not lose it.
+    - transforge-state:/data/.local/state/transforge
+  deploy:
+    resources:
+      limits:
+        memory: ${MEM_LIMIT:-512m}
+        cpus: "${CPU_LIMIT:-1.0}"
+      reservations:
+        memory: ${MEM_RESERVATION:-64m}
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  # One-shot: `docker compose run --rm app <transforge subcommand>`.
+  # `docker compose up` runs it once (prints --help) and exits.
+  app:
+    <<: *common
+    container_name: transforge
+    restart: "no"
+
+  # Optional scheduler (profile "schedule").
+  schedule:
+    <<: *common
+    container_name: transforge-schedule
+    profiles: [schedule]
+    restart: unless-stopped
+    command: ["schedule"]
+    environment:
+      TZ: ${TZ:-UTC}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:1234/v1}
+      TRANSFORGE_LLM_API_KEY: ${TRANSFORGE_LLM_API_KEY:-}
+      STUDIOFORGE_MCP_PIN: ${STUDIOFORGE_MCP_PIN:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      TRANSFORGE_SCHEDULE_CMD: ${TRANSFORGE_SCHEDULE_CMD:-}
+      TRANSFORGE_INTERVAL: ${TRANSFORGE_INTERVAL:-3600}
+    healthcheck:
+      # The scheduler touches a heartbeat file every 30 s.
+      test: ["CMD-SHELL", "find /tmp/heartbeat -mmin -2 2>/dev/null | grep -q ."]
+      start_period: 60s
+      interval: 60s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  # `docker compose down` keeps this volume; `down -v` DELETES the manifests.
+  transforge-state:

@@ -1,0 +1,11 @@
+{
+  "_note": "derived from client code (Rig.chat): POST /v1/chat/completions",
+  "expect_request_keys": ["model", "messages", "max_tokens", "temperature", "priority", "chat_template_kwargs"],
+  "expect_request_headers": {"X-SF-Client": "transforge"},
+  "response": {
+    "model": "vendor/repo-GGUF/model-Q5_K_S",
+    "choices": [{"index": 0, "message": {"role": "assistant", "content": "<think>x</think>hola"}, "finish_reason": "stop"}],
+    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    "studioforge": {"future_additive_field": true}
+  }
+}

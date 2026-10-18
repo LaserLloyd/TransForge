@@ -28,7 +28,12 @@ Commands:
   report   [--append FILE]                 one-shot text report (cron-friendly)
   config   [--site X]                      show resolved configuration
 
-Exit codes: 0 ok · 1 translation/verify failures · 2 usage/config ·
+Auth:   StudioForge API key -> `Authorization: Bearer` on every request:
+        $TRANSFORGE_LLM_API_KEY (or $STUDIOFORGE_API_KEY, or `api_key_env` /
+        `api_key` in the config). X-MCP-Pin on load/unload is DEPRECATED.
+
+Exit codes: 0 ok · 1 translation/verify failures · 2 usage/config (also: the
+            server refused credentials / the lease list with 401/403) ·
             4 rig unreachable · 5 model missing on rig · 6 rig leased (backoff)
 """
 import sys
@@ -41,8 +46,10 @@ import concurrent.futures
 import copy
 import datetime as _dt
 import hashlib
+import importlib.metadata
 import json
 import os
+import posixpath
 import re
 import shutil
 import threading
@@ -60,6 +67,17 @@ STATE_DIR = os.path.expanduser("~/.local/state/transforge")
 # $TRANSFORGE_PIN_ENV_FILE. Opt-in only: no location is ever guessed. The
 # STUDIOFORGE_MCP_PIN environment variable takes precedence over the file.
 PIN_ENV_FILE = os.path.expanduser(os.environ.get("TRANSFORGE_PIN_ENV_FILE", ""))
+
+# StudioForge API key, sent as `Authorization: Bearer <key>` on EVERY request
+# (chat, models, status, leases, load/unload). Resolution order, first hit wins:
+#   1. the env var named by the `api_key_env` config key (if set)
+#   2. $TRANSFORGE_LLM_API_KEY
+#   3. $STUDIOFORGE_API_KEY            (shared name used by the other tools)
+#   4. the `api_key` config key        (literal; prefer an env var -- config.toml
+#                                       is a plain file and `config` never prints it)
+# The key is never logged, printed, or included in an error message.
+API_KEY_ENV = "TRANSFORGE_LLM_API_KEY"
+API_KEY_ENV_FALLBACK = "STUDIOFORGE_API_KEY"
 
 # lease holders whose runs must not be disturbed (CrucibleForge doctrine).
 # FALLBACK ONLY since StudioForge 1.26-09-04: every lease record now carries
@@ -144,6 +162,75 @@ def sf_error(e):
     return code, retry, lease, body
 
 
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow an HTTP redirect from the LLM server.
+
+    urllib's default handler copies EVERY request header -- `Authorization:
+    Bearer <key>` and `X-MCP-Pin` included -- onto the redirected request, to
+    whatever host the Location names. The StudioForge / OpenAI-compatible API
+    never redirects; a 3xx means a proxy in front of it (typically an SSO
+    login) or a wrong endpoint, and following it would hand the key to that
+    host and, for the lease list, read a login page as "no lease". The 3xx is
+    raised as an HTTPError instead (see Rig.leases() for how that one fails)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urllib.parse.urlsplit(newurl)
+        raise urllib.error.HTTPError(
+            req.full_url, code,
+            f"{msg} (redirect to {target.scheme}://{target.netloc} not followed; "
+            "point `endpoint` at the server itself)", headers, fp)
+
+
+_OPENER = urllib.request.build_opener(_RefuseRedirect)
+
+
+def _urlopen(req, timeout):
+    """urlopen() without redirects (credentials never leave the endpoint)."""
+    return _OPENER.open(req, timeout=timeout)
+
+
+_PIN_WARNED = []
+
+
+def _warn_pin_deprecated():
+    """Once per process, when the PIN is the ONLY credential a load/unload
+    rides on: the docs say it goes away in the next release, and an operator
+    who never reads a CHANGELOG would otherwise find out from a 401."""
+    if not _PIN_WARNED:
+        _PIN_WARNED.append(True)
+        print("warning: STUDIOFORGE_MCP_PIN (X-MCP-Pin) is deprecated and will "
+              f"be removed in the release after 0.2.0; set ${API_KEY_ENV} to a "
+              "StudioForge API key instead", file=sys.stderr)
+
+
+class RigAuthError(RuntimeError):
+    """StudioForge answered 401/403 to a request whose answer we must have.
+
+    Raised by Rig.leases(): the lease list is the benchmark-protection gate,
+    and "I was not allowed to read it" is NOT "there is no lease". Failing open
+    here would let a run start straight into a CrucibleForge benchmark. Maps to
+    exit code 2 (a credentials/config problem the operator must fix)."""
+
+
+def http_refusal_message(e):
+    """One line for a reachable-but-refused StudioForge (never contains the key)."""
+    msg = f"rig returned HTTP {e.code} {e.reason} for {e.url}"
+    if e.code in (401, 403):
+        msg += (f" -- StudioForge requires credentials: set ${API_KEY_ENV} "
+                "(or `api_key_env` / `api_key` in the config)")
+        if str(e.url).endswith(("/load-recommended", "/unload")):
+            msg += ("; a StudioForge that predates API keys wants the "
+                    "(deprecated) STUDIOFORGE_MCP_PIN for load/unload")
+    return msg
+
+
+def http_refusal_exit_code(e):
+    """Exit code for a reachable-but-refused StudioForge: 401/403 is a
+    credentials problem (USAGE_ERROR, like the lease-list refusal); anything
+    else is a failed run (1)."""
+    return USAGE_ERROR if e.code in (401, 403) else 1
+
+
 def die(msg, code=USAGE_ERROR):
     """Usage/config error: message on stderr, deterministic exit code."""
     print(msg, file=sys.stderr)
@@ -166,6 +253,8 @@ DEFAULTS = {
     "max_tokens_body_retry": 24000,
     "max_chunk_chars": 12000,
     "extra_params": {},             # merged verbatim into the completion payload
+    "api_key": "",                  # StudioForge bearer key (prefer the env var)
+    "api_key_env": "",              # name of an env var holding the key
     # --- self-recovery from a glossary-bleed verification failure -----------
     "retry_on_verify_fail": 2,      # same-model retries before the fallback model
     "fallback_model": "",           # "" = no model fallback (retries only)
@@ -226,7 +315,7 @@ class SiteConfig:
                   "prompt_template", "max_tokens_fm", "max_tokens_fm_retry",
                   "max_tokens_body", "max_tokens_body_retry", "max_chunk_chars",
                   "extra_params", "retry_on_verify_fail", "fallback_model",
-                  "fallback_prompt_template"):
+                  "fallback_prompt_template", "api_key", "api_key_env"):
             setattr(self, k, merged[k])
         if self.concurrency != "auto":
             try:
@@ -279,14 +368,35 @@ def pick_site(sites, name):
 
 
 # ---------------------------------------------------------------- manifest
+def manifest_key(rel_src, lang):
+    """'<rel_src>|<lang>' with rel_src '/'-separated and normalised.
+
+    The same key on every OS: discovery returns native paths (backslashes on
+    Windows), and before 0.2.0 a Windows run stored MIXED keys
+    ('content/projects\\foo.md'). Keying on the native form made every entry
+    of an older manifest -- or of one written on the other OS, e.g. a Windows
+    manifest in the Linux container -- unmatched: the pages read UNTRACKED and
+    the next status/plan/run PRUNED the entries (src_sha history included, so
+    the documented `accept --all` remedy then accepted STALE siblings as
+    current)."""
+    rel = posixpath.normpath(str(rel_src).replace("\\", "/"))
+    return f"{rel}|{lang}"
+
+
+def _canonical_key(key):
+    rel, sep, lang = str(key).rpartition("|")
+    return manifest_key(rel, lang) if sep else key
+
+
 class Manifest:
-    """entries key: '<rel_src>|<lang>' -> {src_sha, out_sha, cfg, model,
-    out, translated_at, duration_s, accepted}"""
+    """entries key: manifest_key(rel_src, lang) -> {src_sha, out_sha, cfg,
+    model, out, translated_at, duration_s, accepted}"""
 
     def __init__(self, site_name):
         os.makedirs(STATE_DIR, exist_ok=True)
         self.path = os.path.join(STATE_DIR, f"{site_name}-manifest.json")
         self.lock = threading.Lock()
+        self.migrated = 0
         if os.path.isfile(self.path):
             try:
                 with open(self.path, encoding="utf-8") as f:
@@ -295,20 +405,32 @@ class Manifest:
                 die(f"manifest is corrupt: {self.path}: {e}\n"
                     f"delete it and re-run `transforge accept --site {site_name} "
                     f"--all` to rebuild from the siblings on disk")
-            self.entries = data.get("entries", {}) if isinstance(data, dict) else {}
+            raw = data.get("entries", {}) if isinstance(data, dict) else {}
+            self.entries = {}
+            # Re-key older / other-OS manifests in place (persisted by the next
+            # save). Two spellings of one page: keep the newer entry.
+            for k, entry in (raw.items() if isinstance(raw, dict) else ()):
+                ck = _canonical_key(k)
+                if ck != k:
+                    self.migrated += 1
+                prev = self.entries.get(ck)
+                if prev is None or _entry_stamp(entry) >= _entry_stamp(prev):
+                    self.entries[ck] = entry
         else:
             self.entries = {}
 
     def get(self, rel_src, lang):
-        return self.entries.get(f"{rel_src}|{lang}")
+        return self.entries.get(manifest_key(rel_src, lang))
 
     def set(self, rel_src, lang, entry):
         with self.lock:
-            self.entries[f"{rel_src}|{lang}"] = entry
+            self.entries[manifest_key(rel_src, lang)] = entry
 
     def prune(self, valid_keys):
         """Drop entries whose source page or language no longer exists.
+        *valid_keys* are '<rel_src>|<lang>' in any separator form.
         Returns the number removed."""
+        valid_keys = {_canonical_key(k) for k in valid_keys}
         with self.lock:
             dead = [k for k in self.entries if k not in valid_keys]
             for k in dead:
@@ -320,6 +442,10 @@ class Manifest:
             write_atomic(self.path, json.dumps(
                 {"version": 1, "saved_at": now_iso(), "entries": self.entries},
                 indent=1, sort_keys=True), mode=0o600)
+
+
+def _entry_stamp(entry):
+    return str(entry.get("translated_at") or "") if isinstance(entry, dict) else ""
 
 
 # --------------------------------------------------------------- discovery
@@ -338,7 +464,9 @@ def discover_sources(site):
                 continue
             if _opts_out(os.path.join(full, fn)):
                 continue
-            out.append(os.path.join(d, fn))
+            # normpath: content_dirs are written with '/', and on Windows a bare
+            # join would give mixed separators that never match --files specs.
+            out.append(os.path.normpath(os.path.join(d, fn)))
     return out
 
 
@@ -412,23 +540,52 @@ class Rig:
 
     def _req(self, method, path, body=None, pin=False, timeout=30):
         headers = {"Content-Type": "application/json", "X-SF-Client": SF_CLIENT}
+        key = self.api_key()
+        if key:
+            headers["Authorization"] = "Bearer " + key
         if pin:
+            # X-MCP-Pin on load/unload is DEPRECATED (kept for one release:
+            # servers that predate API keys still want it). It is sent whenever
+            # one is available; with an API key it is no longer required.
             p = self.pin()
-            if not p:
+            if p:
+                headers["X-MCP-Pin"] = p
+                if not key:
+                    _warn_pin_deprecated()
+            elif not key:
                 raise RuntimeError(
-                    "STUDIOFORGE_MCP_PIN unavailable — export it in the "
-                    "environment (the server's management PIN is required for "
-                    "model load/settings calls)")
-            headers["X-MCP-Pin"] = p
+                    f"no StudioForge credentials — export ${API_KEY_ENV} "
+                    "(preferred) or STUDIOFORGE_MCP_PIN (deprecated) in the "
+                    "environment; model load/unload calls need one of them")
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.base + path, data=data,
                                      headers=headers, method=method)
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with _urlopen(req, timeout=timeout) as r:
             raw = r.read().decode("utf-8")
             return json.loads(raw) if raw else {}
 
+    def api_key(self):
+        """The StudioForge bearer key, or "" (see API_KEY_ENV above)."""
+        return self._resolve_key()[0]
+
+    def api_key_source(self):
+        """Where the key came from, for display ("env TRANSFORGE_LLM_API_KEY",
+        "config", or "" when unset). Never the key itself."""
+        return self._resolve_key()[1]
+
+    def _resolve_key(self):
+        names = [n for n in (getattr(self.site, "api_key_env", ""),
+                             API_KEY_ENV, API_KEY_ENV_FALLBACK) if n]
+        for n in names:
+            v = os.environ.get(n, "").strip()
+            if v:
+                return v, f"env {n}"
+        v = str(getattr(self.site, "api_key", "") or "").strip()
+        return (v, "config") if v else ("", "")
+
     def pin(self):
-        """Management PIN: environment first, then the opt-in file named by
+        """Management PIN (DEPRECATED, superseded by the API key; kept for one
+        release for servers that still gate load/unload on it): environment first, then the opt-in file named by
         $TRANSFORGE_PIN_ENV_FILE (if set)."""
         if self._pin is None:
             self._pin = os.environ.get("STUDIOFORGE_MCP_PIN", "").strip()
@@ -452,10 +609,37 @@ class Rig:
         return self._req("GET", "/api/status")
 
     def leases(self):
+        """The active lease list.
+
+        FAILS CLOSED when StudioForge refuses the read (HTTP 401/403): the
+        lease list is how a run learns a benchmark owns the GPUs, so an auth
+        refusal must stop the run (RigAuthError), never read as "no lease".
+        A redirect (3xx, not followed -- see _RefuseRedirect) fails closed
+        too: it is how an auth proxy in front of StudioForge says "log in".
+
+        Deliberately still fail-OPEN for everything else -- an unreachable
+        StudioForge (connection refused, DNS, timeout), a server that has no
+        /api/leases (404) or answers 5xx: there is then no gate to consult, and
+        the very next call (models()/chat) fails with the real error (exit 4).
+        """
         try:
             return self._req("GET", "/api/leases", timeout=8).get("leases", [])
+        except urllib.error.HTTPError as e:
+            e.close()
+            if e.code in (401, 403):
+                raise RigAuthError(
+                    f"StudioForge refused the lease list (HTTP {e.code}): "
+                    "cannot tell whether a benchmark holds the GPUs, so not "
+                    f"proceeding. Set ${API_KEY_ENV} (or `api_key_env` / "
+                    "`api_key` in the config) to a valid StudioForge key.")
+            if 300 <= e.code < 400:
+                raise RigAuthError(
+                    f"the lease list answered with a redirect (HTTP {e.code} "
+                    f"{e.reason}): cannot tell whether a benchmark holds the "
+                    "GPUs, so not proceeding.")
+            return []
         except Exception:
-            return []      # unreadable = no lease; the rig, not us, decides
+            return []      # unreachable / no such endpoint: documented above
 
     def bench_lease(self):
         for l in self.leases():
@@ -576,13 +760,13 @@ def warmup(site, rig, quiet=False):
         return workers_for(site, rig)
     # not loaded, or resident on a degenerate plan (e.g. a leftover JIT load:
     # load-recommended would return the existing plan unchanged, so unload first)
-    if not rig.pin():
+    if not (rig.pin() or rig.api_key()):
         if par > 0:
-            print("warning: model resident with parallel=1 and no PIN to re-plan; "
-                  "running serial", file=sys.stderr)
+            print("warning: model resident with parallel=1 and no API key/PIN to "
+                  "re-plan; running serial", file=sys.stderr)
             return 1
-        print("warning: no PIN available — first request will JIT-load (slow, "
-              "planner-default plan)", file=sys.stderr)
+        print("warning: no API key or PIN available — first request will JIT-load "
+              "(slow, planner-default plan)", file=sys.stderr)
         return 1
     if par > 0:
         if not quiet:
@@ -595,6 +779,8 @@ def warmup(site, rig, quiet=False):
             rig.load_recommended(site.model, site.ctx_per_slot, site.priority)
             break
         except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise     # credentials: the caller prints the hint, exit 2
             code, retry, lease, body = sf_error(e)
             if code == "gpu_leased":
                 # A benchmark lease means stand down (exit 6, same as the
@@ -1511,17 +1697,28 @@ def cmd_run(args, sites):
     rig = Rig(site)
     try:
         if args.no_warmup:
+            # --no-warmup skips the model load, not the benchmark gate: without
+            # this read the first minute of jobs (the in-run gate re-reads only
+            # every 60 s) started with no lease check at all.
+            lease = rig.bench_lease()
+            if lease:
+                print(f"rig leased by '{lease.get('holder')}' — backing off",
+                      file=sys.stderr)
+                return 6
             workers = max(1, rig.live_parallel(site.model)) if site.concurrency == "auto" \
                 else max(1, int(site.concurrency))
         else:
             workers = warmup(site, rig)
     except urllib.error.HTTPError as e:
         # reachable, but the server refused: not an unreachable-rig condition
-        print(f"rig returned HTTP {e.code} {e.reason} for {e.url}", file=sys.stderr)
-        return 1
+        print(http_refusal_message(e), file=sys.stderr)
+        return http_refusal_exit_code(e)
     except (urllib.error.URLError, OSError) as e:
         print(f"rig unreachable: {e}", file=sys.stderr)
         return 4
+    except RigAuthError as e:
+        print(str(e), file=sys.stderr)
+        return USAGE_ERROR
     except RuntimeError as e:
         print(f"warmup failed: {e}", file=sys.stderr)
         return 1
@@ -1544,7 +1741,16 @@ def cmd_run(args, sites):
             if time.time() - lease_state["checked"] < 60:
                 return False
             lease_state["checked"] = time.time()
-        lease = rig.bench_lease()
+        try:
+            lease = rig.bench_lease()
+        except RigAuthError as e:
+            # fail closed: cannot read the lease list -> stop starting jobs
+            with lock:
+                lease_state["stop"] = True
+                lease_state["auth"] = True
+                lease_state["holder"] = "lease list unreadable"
+            print(str(e), file=sys.stderr)
+            return True
         if lease:
             with lock:
                 lease_state["stop"] = True
@@ -1617,6 +1823,11 @@ def cmd_run(args, sites):
           + f", {results['fail']} failed, "
           f"{results['leased']} deferred (rig leased) in {dur:.0f}s "
           f"({workers} workers)")
+    if lease_state.get("auth"):
+        # the lease list became unreadable mid-run (key revoked/rotated): a
+        # credentials problem (2), not a lease to wait out (6), or a scheduler
+        # retries every interval without anyone being told to fix the key.
+        return USAGE_ERROR
     if results["fail"]:
         return 1
     return 6 if results["leased"] else 0
@@ -1883,11 +2094,14 @@ def cmd_text(args, sites):
             warmup(site, rig, quiet=True)
     except urllib.error.HTTPError as e:
         # reachable, but the server refused: not an unreachable-rig condition
-        print(f"rig returned HTTP {e.code} {e.reason} for {e.url}", file=sys.stderr)
-        return 1
+        print(http_refusal_message(e), file=sys.stderr)
+        return http_refusal_exit_code(e)
     except (urllib.error.URLError, OSError) as e:
         print(f"rig unreachable: {e}", file=sys.stderr)
         return 4
+    except RigAuthError as e:
+        print(str(e), file=sys.stderr)
+        return USAGE_ERROR
     except RuntimeError as e:
         print(f"warmup failed: {e}", file=sys.stderr)
         return 1
@@ -1982,13 +2196,25 @@ def cmd_config(args, sites):
                   "no_translate", "link_dirs", "retry_on_verify_fail",
                   "fallback_model", "fallback_prompt_template"):
             print(f"  {k} = {getattr(site, k)}")
+        src = Rig(site).api_key_source()
+        print(f"  api_key = {'(set; from ' + src + ')' if src else '(not set)'}")
     return 0
 
 
 # -------------------------------------------------------------------- main
+def package_version():
+    """Installed distribution version; 'unknown' when run from a bare checkout."""
+    try:
+        return importlib.metadata.version("transforge")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
+
+
 def main():
     ap = argparse.ArgumentParser(prog="transforge", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version",
+                    version=f"transforge {package_version()}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(p, langs=True, files=False):
@@ -2056,7 +2282,21 @@ def main():
           "verify": cmd_verify, "warmup": cmd_warmup, "models": cmd_models,
           "report": cmd_report, "config": cmd_config,
           "review": _review.cmd_review}[args.cmd]
-    sys.exit(fn(args, sites))
+    try:
+        rc = fn(args, sites)
+    except RigAuthError as e:
+        print(str(e), file=sys.stderr)
+        rc = USAGE_ERROR
+    except urllib.error.HTTPError as e:
+        # `models` / `warmup` talk to the rig without their own handler: a
+        # refusal is a one-line message and the documented exit code, not a
+        # traceback.
+        print(http_refusal_message(e), file=sys.stderr)
+        rc = http_refusal_exit_code(e)
+    except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
+        print(f"rig unreachable: {e}", file=sys.stderr)
+        rc = 4
+    sys.exit(rc)
 
 
 if __name__ == "__main__":
