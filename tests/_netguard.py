@@ -78,6 +78,32 @@ def check_address(address) -> None:
         _refuse(f"connect to reserved loopback port {_host_str(host)}:{port}")
 
 
+def _guard_asyncio_proactor() -> None:
+    """Guard asyncio's Windows proactor too.
+
+    ``ProactorEventLoop`` (the default loop on Windows) connects with
+    ``ConnectEx`` on the raw socket handle and never calls
+    ``socket.socket.connect``, so without this every asyncio / anyio / httpx
+    ``AsyncClient`` connection bypassed the guard on Windows.  Selector loops
+    (Linux, macOS) already go through the patched ``socket.connect``.
+    """
+    try:
+        from asyncio import windows_events
+    except ImportError:          # not Windows
+        return
+    proactor = getattr(windows_events, "IocpProactor", None)
+    real = getattr(proactor, "connect", None)
+    if real is None or getattr(real, "_netguard", False):
+        return
+
+    def connect(self, conn, address):
+        check_address(address)
+        return real(self, conn, address)
+
+    connect._netguard = True
+    proactor.connect = connect
+
+
 def install(strict_exit: bool = False) -> None:
     """Install the guard (idempotent).
 
@@ -113,6 +139,7 @@ def install(strict_exit: bool = False) -> None:
     socket.socket.connect = connect
     socket.socket.connect_ex = connect_ex
     socket.getaddrinfo = getaddrinfo
+    _guard_asyncio_proactor()
 
     if strict_exit:
         def _report():
