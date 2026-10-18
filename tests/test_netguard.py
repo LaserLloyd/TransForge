@@ -46,5 +46,44 @@ class TestGuard(unittest.TestCase):
         self.assertEqual(_netguard.VIOLATIONS, [])
 
 
+    def _listener(self):
+        srv = socket.socket()
+        self.addCleanup(srv.close)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        return srv.getsockname()[1]
+
+    def test_asyncio_connections_are_guarded_too(self):
+        """asyncio's default loop on Windows (proactor / ConnectEx) never calls
+        socket.connect; the guard must still refuse a reserved port there.
+        Uses a listener this test owns, temporarily treated as reserved."""
+        import asyncio
+
+        port = self._listener()
+        saved = _netguard.BLOCKED_LOOPBACK_PORTS
+        _netguard.BLOCKED_LOOPBACK_PORTS = frozenset({port})
+        self.addCleanup(setattr, _netguard, "BLOCKED_LOOPBACK_PORTS", saved)
+
+        async def attempt():
+            _reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.close()
+
+        with self.assertRaises(OSError):
+            asyncio.run(attempt())
+        self.assertTrue(any(str(port) in v for v in _netguard.VIOLATIONS), _netguard.VIOLATIONS)
+
+    def test_asyncio_connection_to_an_ephemeral_port_is_allowed(self):
+        import asyncio
+
+        port = self._listener()
+
+        async def attempt():
+            _reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.close()
+
+        asyncio.run(attempt())
+        self.assertEqual(_netguard.VIOLATIONS, [])
+
+
 if __name__ == "__main__":
     unittest.main()
