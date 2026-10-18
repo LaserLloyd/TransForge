@@ -79,7 +79,11 @@ Siblings are written next to your sources (the site tree is mounted read-write);
 | `DEEPSEEK_API_KEY` | empty | only for the opt-in `review` stage |
 | `CONFIG_PATH` / `SITES_PATH` | `./config` / `./sites` | host paths, relative to `deploy/compose/` |
 
-**Ports:** none. TransForge only makes outbound calls to your LLM server (reach the host's server at `host.docker.internal`; it must listen on an address the container can reach).
+| Port | What |
+|---|---|
+| none | TransForge opens no port of its own. It only makes outbound calls to the LLM server (default `http://127.0.0.1:1234/v1`, the StudioForge **gateway**; the panel on :8080 does not serve `/v1`). |
+
+From a container, reach the host's server at `host.docker.internal`; it must listen on an address the container can reach.
 
 Scheduled translation (optional, `restart: unless-stopped`):
 
