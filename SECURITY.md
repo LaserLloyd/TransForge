@@ -27,6 +27,7 @@ Only the latest release receives fixes while the project is pre-1.0.
 - **`X-MCP-Pin`** on model load/unload is deprecated and will be removed in the
   release after 0.2.0. It is read from `STUDIOFORGE_MCP_PIN` (or the opt-in file
   named by `TRANSFORGE_PIN_ENV_FILE`) and is sent only on load/unload.
+- **Legacy MCP PIN** is set and rotated in StudioForge (`mcp.pin` setting) and is scheduled for removal; do not rely on it for new setups.
 - **Cloud `review` stage** is off by default; when enabled it sends the
   above-the-fold part of each page to the configured API, with a key read from
   the environment variable named by `api_key_env` in `[review]`.
