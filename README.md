@@ -499,6 +499,8 @@ shows where the key came from and never prints it. Steps 3–4 additionally send
 deprecated as of 0.2.0 and will be removed in the next release. A 401/403 on the lease list now stops the run (exit code 2)
 instead of reading as "no lease"; an unreachable StudioForge or a 404/5xx on the lease list behaves as before.
 
+The legacy MCP PIN is set and rotated in StudioForge (`mcp.pin` setting) and is scheduled for removal; do not rely on it for new setups.
+
 ## Structural verification
 
 Every translated document is checked before it is written; a failure aborts that
