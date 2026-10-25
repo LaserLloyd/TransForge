@@ -611,4 +611,5 @@ Personal-identifier rules (names, hostnames) go in the git-ignored
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT No Attribution ([MIT-0](LICENSE)). You don't need to credit this project — but if you do, a link back is appreciated.
+Releases up to 0.2.0 were MIT.

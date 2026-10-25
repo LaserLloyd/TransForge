@@ -56,7 +56,7 @@ LABEL org.opencontainers.image.title="TransForge" \
       org.opencontainers.image.source="https://github.com/LaserLloyd/TransForge" \
       # scrub-ok-next: public repo URL
       org.opencontainers.image.documentation="https://github.com/LaserLloyd/TransForge/blob/master/docs/deploy/docker.md" \
-      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.licenses="MIT-0" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.created="${CREATED}"

@@ -3,6 +3,15 @@
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/) (pre-1.0: minor bumps may change behaviour).
 
+## Unreleased
+
+### Changed
+- **Licence: MIT No Attribution (MIT-0).** You can use, copy, change and ship
+  TransForge with no conditions; no copyright notice has to be kept. You don't
+  need to credit this project — but if you do, a link back is appreciated.
+  `LICENSE`, `pyproject.toml`, the Docker image label and the README say so.
+  Releases up to 0.2.0 were MIT.
+
 ## 0.2.0
 
 ### Added

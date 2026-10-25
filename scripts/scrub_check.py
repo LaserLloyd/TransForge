@@ -286,7 +286,7 @@ def local_rule_summary() -> tuple[int, str]:
 
 
 # The one place a personal name is published on purpose: a copyright line
-# names its holder, and MIT requires it to survive verbatim. Only the LOCAL
+# names its holder in LICENSE (MIT-0) on purpose. Only the LOCAL
 # identifier rules are relaxed here — every credential, path and host rule
 # still applies to this file.
 LOCAL_RULE_EXEMPT = {"LICENSE", "LICENSE.md", "LICENSE.txt", "COPYING"}
