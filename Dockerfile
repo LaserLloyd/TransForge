@@ -52,8 +52,10 @@ ARG CREATED
 
 LABEL org.opencontainers.image.title="TransForge" \
       org.opencontainers.image.description="Config-driven website translator that runs against your own local LLM server" \
+      # scrub-ok-next: public repo URL
       org.opencontainers.image.source="https://github.com/LaserLloyd/TransForge" \
-      org.opencontainers.image.documentation="https://github.com/LaserLloyd/TransForge/blob/main/docs/deploy/docker.md" \
+      # scrub-ok-next: public repo URL
+      org.opencontainers.image.documentation="https://github.com/LaserLloyd/TransForge/blob/master/docs/deploy/docker.md" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}" \

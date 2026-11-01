@@ -52,8 +52,7 @@ None. TransForge opens no listening socket (it is a client of your LLM server).
 | Variable | Default | Meaning |
 |---|---|---|
 | `LLM_BASE_URL` | `http://host.docker.internal:1234/v1` | Your StudioForge / llama.cpp server **as seen from the container**. TransForge has no environment variable of its own for this (it is `endpoint` in `config.toml`), so it is applied once, when the config is first seeded; a trailing `/v1` is dropped because TransForge wants the server root. Edit `endpoint` in `config.toml` afterwards. |
-| `TRANSFORGE_LLM_API_KEY` | empty | StudioForge API key, sent as `Authorization: Bearer` on every request. A 401/403 from the server stops the run with exit code 2 and a hint. |
-| `STUDIOFORGE_MCP_PIN` | empty | Legacy StudioForge management PIN for `warmup` / `load-recommended` (deprecated; not needed with an API key). Without either TransForge warns and runs serially on whatever plan the server chose. |
+| `TRANSFORGE_LLM_API_KEY` | empty | StudioForge API key, sent as `Authorization: Bearer` on every request. It is the only credential: the legacy management PIN credential was removed in 0.3.0. A 401/403 from the server stops the run with exit code 2 and a hint. |
 | `DEEPSEEK_API_KEY` | empty | Only for the opt-in `transforge review` stage; the variable *name* must match `[review] api_key_env`. |
 | `CONFIG_PATH`, `SITES_PATH` | `./config`, `./sites` | Host paths (relative to `deploy/compose/`). |
 | `MEM_LIMIT` / `CPU_LIMIT` | `512m` / `1.0` | Resource limits. |
@@ -168,7 +167,12 @@ drop to `PUID:PGID` (`setpriv`); the app process runs with no capabilities.
 Built `FROM ghcr.io/astral-sh/uv:python3.13-trixie-slim` and run on
 `python:3.13-slim-trixie` (same interpreter at the same path, uv not in the
 runtime image), non-root UID 1000, tini via `init: true`. There is no
-`HEALTHCHECK` in the image (no HTTP surface). Tagged releases are published as
-`ghcr.io/laserlloyd/transforge:<version>` with a CycloneDX SBOM, SHA256SUMS, a
-cosign keyless signature and build-provenance attestation (see
-`.github/workflows/containers.yml`).
+`HEALTHCHECK` in the image (no HTTP surface).
+
+**No published image yet.** `.github/workflows/containers.yml` builds the image
+on every push and pull request as a check only; nothing is pushed anywhere.
+The first pushed `v*` tag will publish it to GHCR as
+`ghcr.io/laserlloyd/transforge:<version>`, <!-- scrub-ok: public image name -->
+sign it (cosign keyless) and attach the SBOM and SHA256SUMS. GHCR creates a new
+package private, so making it public is a one-time setting by the repository
+owner. Until then, build locally with the `git clone` + compose steps above.

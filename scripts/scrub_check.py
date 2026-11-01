@@ -33,6 +33,9 @@ Design notes
 * **False positives are expected and cheap to handle**: add an inline
   `# scrub-ok: <reason>` comment on the offending line. That marker is
   deliberately noisy so it shows up in review.
+* **`scrub-ok-next` suppresses the FOLLOWING line** (file scan only). It is for
+  lines that cannot carry a trailing comment, such as the inside of a
+  backslash-continued Dockerfile `LABEL`. It covers exactly one line.
 * **`--staged` reads the INDEX, not the working tree.** Those are different
   files, and the difference is exploitable: `git add secrets.py`, edit the
   secret out of the working copy, commit — the hook reads the clean working
@@ -219,6 +222,11 @@ CONTENT_RULES: list[tuple[re.Pattern, str]] = [
 # C/JS block and line, HTML/Markdown, and SQL (the design docs carry DDL).
 OK_MARKER = re.compile(r"(?:#|//|--)\s*scrub-ok\b"
                        r"|(?:/\*|<!--)\s*scrub-ok\b")
+
+# Same comment syntaxes; suppresses the NEXT line only (file scan, not commit
+# messages). For lines that cannot take a trailing comment.
+OK_NEXT_MARKER = re.compile(r"(?:#|//|--)\s*scrub-ok-next\b"
+                            r"|(?:/\*|<!--)\s*scrub-ok-next\b")
 
 
 def load_local_rules() -> list[tuple[re.Pattern, str]]:
@@ -549,8 +557,10 @@ def scan(root: Path, staged: bool = False, rev: str | None = None,
 
         in_fixtures = bool(FIXTURE_PATH.search(rel))
         is_license = Path(rel).name in LOCAL_RULE_EXEMPT
+        skip_next = False
         for lineno, line in enumerate(text.splitlines(), 1):
-            if OK_MARKER.search(line):
+            skipped, skip_next = skip_next, bool(OK_NEXT_MARKER.search(line))
+            if skipped or OK_MARKER.search(line):
                 continue
             for pattern, why in rules:
                 if in_fixtures and why in HEURISTIC_IN_FIXTURES:
@@ -759,6 +769,17 @@ def selftest() -> int:
             "gateway at 100.100.10.7  # scrub-ok: fixture\n", encoding="utf-8")
         if any("marked.txt" in p for p in scan(fixtures)):
             failures.append("a scrub-ok marker did not suppress the hit")
+
+        # scrub-ok-next covers the immediately following line only.
+        (fixtures / "next-ok.txt").write_text(
+            "# scrub-ok-next: fixture\ngateway at 100.100.10.7\n", encoding="utf-8")
+        if any("next-ok.txt" in p for p in scan(fixtures)):
+            failures.append("a scrub-ok-next marker did not suppress the next line")
+        (fixtures / "next-far.txt").write_text(
+            "# scrub-ok-next: fixture\nplain line\ngateway at 100.100.10.7\n",
+            encoding="utf-8")
+        if not any("next-far.txt" in p for p in scan(fixtures)):
+            failures.append("a scrub-ok-next marker reached past the next line")
 
         # --- commit-message fixtures ----------------------------------------
         for name, body in positives.items():
