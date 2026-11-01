@@ -3,6 +3,16 @@
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/) (pre-1.0: minor bumps may change behaviour).
 
+## 0.3.1 — 2026-11-01
+
+### Added
+- `backend = "openai"` (default `"studioforge"`, unchanged): translate through
+  any OpenAI-compatible cloud API such as MiniMax. No lease/bench gate, no
+  model load, no `priority`/`chat_template_kwargs`; integer `concurrency`
+  (`"auto"` = 4); a rig `fallback_model` is ignored (`openai_fallback_model`
+  opts in). The rig's key env vars are never sent to the cloud endpoint.
+- HTTP 402 (plan window exhausted) stops the run with exit code 8, no retry.
+
 ## 0.3.0 — 2026-11-01
 
 ### Added

@@ -354,6 +354,7 @@ translate_fields = ["title", "excerpt"]
 | Key | Default | Meaning |
 |---|---|---|
 | `endpoint` | `http://localhost:1234` | Base URL of your StudioForge/llama.cpp server, e.g. `http://localhost:1234` |
+| `backend` | `"studioforge"` | `"studioforge"` (leases, warmup/load, priority) or `"openai"`: any OpenAI-compatible cloud API (e.g. MiniMax, `endpoint = "https://api.minimax.io"`, key via `api_key_env`). The `openai` backend has no lease/bench gate, no model load or `/api/status`, sends no `priority`/`chat_template_kwargs` (only the `extra_params` you list), uses an integer `concurrency` (`"auto"` = 4), and ignores `fallback_model` (set `openai_fallback_model` for a cloud one). HTTP 402 stops the run (exit 8). |
 | `model` | `unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q5_K_S` | Full StudioForge model id (`publisher/repo/file-stem`) |
 | `concurrency` | `"auto"` | `"auto"` = follow the server's parallel slots; an integer caps it (still clamped to the live slot count) |
 | `ctx_per_slot` | `16384` | Context per slot requested at warmup |
@@ -529,6 +530,7 @@ by it: `/projects/foo/` becomes `/ja/projects/foo/` only when
 | 5 | Configured model not present on the rig |
 | 6 | Rig leased by a benchmark holder — some or all jobs deferred |
 | 7 | `review`: the configured API-key environment variable is not set |
+| 8 | `backend = "openai"`: the cloud plan's usage window is exhausted (HTTP 402); stopped without retrying |
 
 ## Optional review stage
 

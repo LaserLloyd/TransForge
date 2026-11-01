@@ -34,7 +34,13 @@ Auth:   StudioForge API key -> `Authorization: Bearer` on every request:
 
 Exit codes: 0 ok · 1 translation/verify failures · 2 usage/config (also: the
             server refused credentials / the lease list with 401/403) ·
-            4 rig unreachable · 5 model missing on rig · 6 rig leased (backoff)
+            4 rig unreachable · 5 model missing on rig · 6 rig leased (backoff) ·
+            8 cloud plan exhausted (HTTP 402 on `backend = "openai"`; no retry,
+            wait for the plan window to reset)
+
+Backends: `backend = "studioforge"` (default; leases, warmup, priority) or
+        `backend = "openai"` (any OpenAI-compatible cloud API, e.g. MiniMax:
+        no lease/bench gate, no model load, plain integer concurrency).
 """
 import sys
 
@@ -114,10 +120,17 @@ def _is_bench_lease(lease) -> bool:
 
 
 USAGE_ERROR = 2
+QUOTA_EXHAUSTED = 8      # cloud plan window used up (HTTP 402): stop, don't retry
 
 # StudioForge's per-client attribution header (`/api/status.clients`). One
 # distinct value per tool on the box; without it every caller is one bare-IP row.
 SF_CLIENT = "transforge"
+
+
+class QuotaExhausted(Exception):
+    """HTTP 402 from an `openai`-backend server: the plan's usage window is
+    spent. Deliberately NOT a RuntimeError, so the recovery ladder (which
+    catches RuntimeError) cannot swallow it and retry into a dead plan."""
 
 
 class RigLeased(RuntimeError):
@@ -218,6 +231,8 @@ def http_refusal_exit_code(e):
     """Exit code for a reachable-but-refused StudioForge: 401/403 is a
     credentials problem (USAGE_ERROR, like the lease-list refusal); anything
     else is a failed run (1)."""
+    if e.code == 402:
+        return QUOTA_EXHAUSTED        # cloud plan window used up
     return USAGE_ERROR if e.code in (401, 403) else 1
 
 
@@ -245,6 +260,8 @@ DEFAULTS = {
     "extra_params": {},             # merged verbatim into the completion payload
     "api_key": "",                  # StudioForge bearer key (prefer the env var)
     "api_key_env": "",              # name of an env var holding the key
+    "backend": "studioforge",       # or "openai": generic cloud OpenAI-compatible API
+    "openai_fallback_model": "",    # openai backend only; "" = no model fallback
     # --- self-recovery from a glossary-bleed verification failure -----------
     "retry_on_verify_fail": 2,      # same-model retries before the fallback model
     "fallback_model": "",           # "" = no model fallback (retries only)
@@ -305,14 +322,27 @@ class SiteConfig:
                   "prompt_template", "max_tokens_fm", "max_tokens_fm_retry",
                   "max_tokens_body", "max_tokens_body_retry", "max_chunk_chars",
                   "extra_params", "retry_on_verify_fail", "fallback_model",
-                  "fallback_prompt_template", "api_key", "api_key_env"):
+                  "fallback_prompt_template", "api_key", "api_key_env", "backend",
+                  "openai_fallback_model"):
             setattr(self, k, merged[k])
+        if self.backend not in ("studioforge", "openai"):
+            die(f"site {name}: backend must be \"studioforge\" or \"openai\" "
+                f"(got {self.backend!r})")
+        if self.openai:
+            # `fallback_model` names a RIG model; never send it to a cloud API.
+            self.fallback_model = self.openai_fallback_model
+            if self.concurrency == "auto":
+                self.concurrency = 4
         if self.concurrency != "auto":
             try:
                 self.concurrency = int(self.concurrency)
             except (TypeError, ValueError):
                 die(f"site {name}: concurrency must be \"auto\" or an integer "
                     f"(got {self.concurrency!r})")
+
+    @property
+    def openai(self):
+        return self.backend == "openai"
 
     def lang_name(self, lang):
         return self.lang_names.get(lang, lang)
@@ -528,7 +558,9 @@ class Rig:
         self.site = site
 
     def _req(self, method, path, body=None, need_key=False, timeout=30):
-        headers = {"Content-Type": "application/json", "X-SF-Client": SF_CLIENT}
+        headers = {"Content-Type": "application/json"}
+        if not self.site.openai:
+            headers["X-SF-Client"] = SF_CLIENT
         key = self.api_key()
         if key:
             headers["Authorization"] = "Bearer " + key
@@ -554,8 +586,11 @@ class Rig:
         return self._resolve_key()[1]
 
     def _resolve_key(self):
+        # The rig's env keys are never offered to a cloud endpoint.
         names = [n for n in (getattr(self.site, "api_key_env", ""),
-                             API_KEY_ENV, API_KEY_ENV_FALLBACK) if n]
+                             API_KEY_ENV, API_KEY_ENV_FALLBACK) if n] \
+            if not self.site.openai else [self.site.api_key_env]
+        names = [n for n in names if n]
         for n in names:
             v = os.environ.get(n, "").strip()
             if v:
@@ -567,6 +602,8 @@ class Rig:
         return self._req("GET", "/v1/models").get("data", [])
 
     def status(self):
+        if self.site.openai:
+            return {}                 # no rig, nothing loaded
         return self._req("GET", "/api/status")
 
     def leases(self):
@@ -615,6 +652,8 @@ class Rig:
             return []      # unreachable / no such endpoint: documented above
 
     def bench_lease(self):
+        if self.site.openai:
+            return None               # a cloud API has no GPU lease book
         for l in self.leases():
             if _is_bench_lease(l):
                 return l
@@ -655,6 +694,15 @@ class Rig:
     def chat(self, messages, max_tokens, temperature):
         payload = {"model": self.site.model, "messages": messages,
                    "max_tokens": max_tokens, "temperature": temperature}
+        if self.site.openai:
+            # Cloud API: only the standard fields plus whatever the site
+            # config explicitly lists in extra_params.
+            payload.update(self.site.extra_params or {})
+        else:
+            self._rig_params(payload)
+        return self._chat(payload)
+
+    def _rig_params(self, payload):
         # Admission tier for THIS request (D48: 1 chat / 2 agent / 3
         # background; anything else is a 400). The load was already tiered via
         # load-recommended; without this key every request competed at default
@@ -665,6 +713,8 @@ class Rig:
         if self.site.disable_thinking:
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         payload.update(self.site.extra_params or {})
+
+    def _chat(self, payload):
         last_err = None
         for attempt in range(3):
             try:
@@ -680,6 +730,12 @@ class Rig:
                                         msg.get("content") or "", flags=re.DOTALL).strip()
                 return data
             except urllib.error.HTTPError as e:
+                if e.code == 402 and self.site.openai:
+                    e.close()
+                    raise QuotaExhausted(
+                        f"HTTP 402 from {self.base}: the plan's usage window is "
+                        "exhausted (5-hour/weekly limit). Not retrying; run again "
+                        "after the window resets.")
                 code, retry, lease, body = sf_error(e)
                 last_err = f"HTTP {e.code} [{code or '-'}]: {body[:300]!r}"
                 if code == "gpu_leased":
@@ -708,7 +764,16 @@ class Rig:
 
 def warmup(site, rig, quiet=False):
     """Ensure the configured model is resident on a sane plan. Returns worker
-    count. Never displaces a busy/pinned resident; backs off for bench leases."""
+    count. Never displaces a busy/pinned resident; backs off for bench leases.
+    On the `openai` backend: only check the model is offered, then return the
+    configured integer concurrency (no lease, no load)."""
+    if site.openai:
+        ids = [m.get("id") for m in rig.models()]
+        if ids and site.model not in ids:
+            print(f"model not offered by {site.endpoint}: {site.model}",
+                  file=sys.stderr)
+            sys.exit(5)
+        return max(1, int(site.concurrency))
     lease = rig.bench_lease()
     if lease:
         print(f"rig leased by '{lease.get('holder')}' — backing off", file=sys.stderr)
@@ -778,6 +843,8 @@ def warmup(site, rig, quiet=False):
 
 
 def workers_for(site, rig):
+    if site.openai:
+        return max(1, int(site.concurrency))
     par = max(1, rig.live_parallel(site.model))
     if site.concurrency == "auto":
         return par
@@ -1680,6 +1747,8 @@ def cmd_run(args, sites):
                 return 6
             workers = max(1, rig.live_parallel(site.model)) if site.concurrency == "auto" \
                 else max(1, int(site.concurrency))
+            if site.openai:
+                workers = max(1, int(site.concurrency))
         else:
             workers = warmup(site, rig)
     except urllib.error.HTTPError as e:
@@ -1772,6 +1841,12 @@ def cmd_run(args, sites):
                 print(f"WARN [{state:>16}] {lang} {rel_src}: glossary terms used "
                       "more often than the source (spot-check for bleed): "
                       + ", ".join(increased), file=sys.stderr)
+        except QuotaExhausted as e:
+            with lock:
+                results["quota"] = results.get("quota", 0) + 1
+                lease_state["stop"] = True
+                lease_state["holder"] = "plan quota (HTTP 402)"
+            print(f"STOP [{state:>16}] {lang} {rel_src}: {e}", file=sys.stderr)
         except RigLeased as e:
             # A mid-run lease refusal is the lease gate firing late: defer the
             # page (not a failure), stop starting new ones, exit 6.
@@ -1801,6 +1876,8 @@ def cmd_run(args, sites):
         # credentials problem (2), not a lease to wait out (6), or a scheduler
         # retries every interval without anyone being told to fix the key.
         return USAGE_ERROR
+    if results.get("quota"):
+        return QUOTA_EXHAUSTED
     if results["fail"]:
         return 1
     return 6 if results["leased"] else 0
@@ -2416,6 +2493,9 @@ def main():
         # traceback.
         print(http_refusal_message(e), file=sys.stderr)
         rc = http_refusal_exit_code(e)
+    except QuotaExhausted as e:
+        print(str(e), file=sys.stderr)
+        rc = QUOTA_EXHAUSTED
     except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
         print(f"rig unreachable: {e}", file=sys.stderr)
         rc = 4
