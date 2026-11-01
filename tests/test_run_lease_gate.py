@@ -4,7 +4,7 @@
   problem: exit 2, not 6 ("leased, back off and retry");
 * --no-warmup still reads the lease list before the first job (the in-run
   gate only re-reads every 60 s);
-* a 401/403 on load-recommended is a refusal (exit 2 with the PIN hint), not a
+* a 401/403 on load-recommended is a refusal (exit 2 with the API-key hint), not a
   generic "warmup failed" (exit 1).
 
 Run from the repo root:  python -m unittest discover -s tests
@@ -33,7 +33,7 @@ tf = importlib.util.module_from_spec(_spec)
 sys.modules["transforge_run_gate_mod"] = tf
 _spec.loader.exec_module(tf)
 
-KEY_ENVS = ("TRANSFORGE_LLM_API_KEY", "STUDIOFORGE_API_KEY", "STUDIOFORGE_MCP_PIN")
+KEY_ENVS = ("TRANSFORGE_LLM_API_KEY", "STUDIOFORGE_API_KEY")
 
 
 def write(path, text):
@@ -69,9 +69,6 @@ class ScriptedRig:
     def wait_ready(self, model_id, timeout_s=900):
         return self.loaded_row(model_id)
 
-    def pin(self):
-        return ""
-
     def api_key(self):
         return "k"
 
@@ -91,9 +88,6 @@ class _RunCase(unittest.TestCase):
         p = mock.patch.dict(os.environ, env, clear=True)
         p.start()
         self.addCleanup(p.stop)
-        q = mock.patch.object(tf, "PIN_ENV_FILE", "")
-        q.start()
-        self.addCleanup(q.stop)
         self.translated = []
 
     def site(self, **kw):
@@ -157,7 +151,7 @@ class TestNoWarmupStillChecksTheLease(_RunCase):
 
 
 class TestLoadRefusal(_RunCase):
-    def test_401_on_load_recommended_exits_2_with_the_pin_hint(self):
+    def test_401_on_load_recommended_exits_2_with_the_api_key_hint(self):
         os.environ["TRANSFORGE_LLM_API_KEY"] = "sk-test-load"
         with FakeStudioForge() as sf:
             sf.route("GET", "/api/leases", 200, {"leases": []})
@@ -168,7 +162,7 @@ class TestLoadRefusal(_RunCase):
             rc, err = self.run_cmd(self.site(endpoint=sf.url))
         self.assertEqual(rc, 2)
         self.assertIn("HTTP 401", err)
-        self.assertIn("STUDIOFORGE_MCP_PIN", err)
+        self.assertIn("TRANSFORGE_LLM_API_KEY", err)
         self.assertNotIn("sk-test-load", err)
         self.assertEqual(self.translated, [])
 

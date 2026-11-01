@@ -35,9 +35,8 @@ x-common: &common
     # StudioForge API key, sent as `Authorization: Bearer` on every request.
     # Prefer the env file (chmod 0600) over putting the value on a command line.
     TRANSFORGE_LLM_API_KEY: ${TRANSFORGE_LLM_API_KEY:-}
-    # Legacy StudioForge management PIN for warmup/load-recommended
-    # (deprecated; not needed when an API key is set).
-    STUDIOFORGE_MCP_PIN: ${STUDIOFORGE_MCP_PIN:-}
+    # (The legacy PIN credential was removed in 0.3.0; the API key above is
+    # the only credential.)
     # Opt-in `transforge review` stage: name the variable in config.toml
     # ([review] api_key_env) and pass its value through .env.
     DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
@@ -93,12 +92,19 @@ services:
       TZ: ${TZ:-UTC}
       LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:1234/v1}
       TRANSFORGE_LLM_API_KEY: ${TRANSFORGE_LLM_API_KEY:-}
-      STUDIOFORGE_MCP_PIN: ${STUDIOFORGE_MCP_PIN:-}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       TRANSFORGE_SCHEDULE_CMD: ${TRANSFORGE_SCHEDULE_CMD:-}
       TRANSFORGE_INTERVAL: ${TRANSFORGE_INTERVAL:-3600}
     healthcheck:
-      # The scheduler touches a heartbeat file every 30 s.
+      # What this proves: the scheduler loop shell is alive. A ticker touches
+      # /tmp/heartbeat every 30 s for as long as that loop lives, so a long
+      # translation run does not flip the container to unhealthy.
+      # What it does NOT prove: that a run is making progress. A run hung on a
+      # stuck LLM server keeps the container "healthy". For that, read the
+      # logs (`docker compose logs schedule`): the entrypoint logs each
+      # start ("schedule every ...") and "scheduled run exited non-zero (will
+      # retry next interval)" for a failed run; TransForge's own output and
+      # exit status are in the same stream. There is no run timeout.
       test: ["CMD-SHELL", "find /tmp/heartbeat -mmin -2 2>/dev/null | grep -q ."]
       start_period: 60s
       interval: 60s

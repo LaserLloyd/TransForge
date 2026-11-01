@@ -53,6 +53,28 @@ class TestPuidPath(unittest.TestCase):
         self.assertIn("/sites", re.search(
             r"-m 0755 ([^&]+)&&", read("Dockerfile").replace("\\\n", " ")).group(1))
 
+    def test_config_seed_is_escaped_atomic_and_fails_without_template(self):
+        """Issue #12: `sed "s|@ENDPOINT@|${ENDPOINT}|"` broke on | & \\ in the
+        URL, and a missing template left an empty config that was never
+        re-seeded (the shell truncates the target first)."""
+        text = read("deploy/docker-entrypoint.sh")
+        self.assertNotIn("s|@ENDPOINT@|${ENDPOINT}|", text)
+        seed = text.split("# ---- 4. first-start config seed", 1)[1]
+        seed = seed.split("# ---- 6.", 1)[0]
+        missing = re.search(r'\[ -f "\$TEMPLATE" \] \|\| (\w+) ', seed)
+        self.assertIsNotNone(missing, "template-missing branch not found")
+        self.assertEqual(missing.group(1), "die")
+        self.assertRegex(text, r"die\(\) \{[^}]*exit 1")
+        # temp file + mv, never a direct redirect into $CFG
+        self.assertIn('mv "$TMP_CFG" "$CFG"', seed)
+        self.assertNotRegex(seed, r'>\s*"\$CFG"')
+
+    def test_no_pin_credential_in_deploy_files(self):
+        for rel in ("deploy/compose/compose.yml", "deploy/compose/.env.example",
+                    "docs/deploy/docker.md", "deploy/docker-entrypoint.sh"):
+            text = read(rel)
+            self.assertNotRegex(text, r"(?i)mcp.pin|PIN_ENV_FILE", rel)
+
     def test_ci_smoke_runs_the_puid_path(self):
         wf = read(".github/workflows/containers.yml")
         self.assertIn("-e PUID=1001", wf)

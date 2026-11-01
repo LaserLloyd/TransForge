@@ -17,7 +17,7 @@ are missing or stale using a **content-hash manifest** (never mtimes),
 translates only those, verifies the output structurally, and writes siblings
 atomically. A hand-edited sibling is never overwritten without `--force`.
 
-Two files: `transforge.py` (the CLI) and `review.py` (the optional review
+The program is two files: `transforge.py` (the CLI) and `review.py` (the optional review
 stage, loaded from the same directory). Requires Python 3.11+ (`tomllib`) and
 PyYAML.
 
@@ -298,7 +298,6 @@ Docker settings in `deploy/compose/.env`:
 |---|---|---|
 | `LLM_BASE_URL` | `http://host.docker.internal:1234/v1` | your StudioForge / llama.cpp server as the container sees it; seeds `endpoint` once (a trailing `/v1` is dropped) |
 | `TRANSFORGE_LLM_API_KEY` | empty | StudioForge API key, sent as `Authorization: Bearer` on every request (see "Warmup, concurrency, leases") |
-| `STUDIOFORGE_MCP_PIN` | empty | legacy management PIN for warmup / load-recommended (deprecated as of 0.2.0, removed in the next release; not needed with an API key) |
 | `DEEPSEEK_API_KEY` | empty | only for the opt-in `review` stage |
 | `CONFIG_PATH` / `SITES_PATH` | `./config` / `./sites` | host paths, relative to `deploy/compose/` |
 
@@ -494,12 +493,13 @@ overrides it. Smaller `ctx_per_slot` generally buys more slots.
 
 Steps 1–4 send `Authorization: Bearer <key>` on every request. Set `TRANSFORGE_LLM_API_KEY`
 (or `STUDIOFORGE_API_KEY`, or `api_key_env` / `api_key` under `[defaults]` in the config); `transforge config`
-shows where the key came from and never prints it. Steps 3–4 additionally send the legacy management PIN as
-`X-MCP-Pin` (from `STUDIOFORGE_MCP_PIN` or the file named by `TRANSFORGE_PIN_ENV_FILE`); the PIN path is
-deprecated as of 0.2.0 and will be removed in the next release. A 401/403 on the lease list now stops the run (exit code 2)
-instead of reading as "no lease"; an unreachable StudioForge or a 404/5xx on the lease list behaves as before.
+shows where the key came from and never prints it. The legacy `X-MCP-Pin` credential
+(`STUDIOFORGE_MCP_PIN`, `TRANSFORGE_PIN_ENV_FILE`) was removed in 0.3.0 and is ignored. A 401/403 on the lease list now stops the run (exit code 2)
+instead of reading as "no lease"; an unreachable StudioForge or a 404/5xx on the lease list behaves as before (silently); a 200 that is not a lease list prints one warning and proceeds without benchmark protection.
 
-The legacy MCP PIN is set and rotated in StudioForge (`mcp.pin` setting) and is scheduled for removal; do not rely on it for new setups.
+`--no-warmup` skips the model load and plan check (steps 2–5), not the lease check everywhere: `run` still reads
+`/api/leases` once before the first job (exit **6** if a benchmark holds a lease), while `single` and `text` with
+`--no-warmup` make no lease check at all.
 
 ## Structural verification
 

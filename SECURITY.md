@@ -4,10 +4,9 @@
 
 Please do not open a public issue for a security problem.
 
-- Contact: **[placeholder: the maintainer sets a private security contact here
-  before the first public release]**
-- If the repository is hosted on GitHub, use "Report a vulnerability" (private
-  vulnerability reporting) under the Security tab once it is enabled.
+Report it privately through GitHub: open the repository's Security tab and choose
+"Report a vulnerability" (https://github.com/LaserLloyd/TransForge/security). <!-- scrub-ok: public repo URL -->
+This is the only reporting channel.
 
 Include the TransForge version (`pyproject.toml`), your OS, and the smallest
 config that reproduces the problem. Do not attach real API keys, StudioForge
@@ -24,10 +23,8 @@ Only the latest release receives fixes while the project is pre-1.0.
   `Authorization: Bearer <key>` to the configured `endpoint` only. It is never
   logged, printed by `transforge config`, or included in error messages.
   Prefer the environment variable: `config.toml` is a plain file.
-- **`X-MCP-Pin`** on model load/unload is deprecated and will be removed in the
-  release after 0.2.0. It is read from `STUDIOFORGE_MCP_PIN` (or the opt-in file
-  named by `TRANSFORGE_PIN_ENV_FILE`) and is sent only on load/unload.
-- **Legacy MCP PIN** is set and rotated in StudioForge (`mcp.pin` setting) and is scheduled for removal; do not rely on it for new setups.
+- The legacy **`X-MCP-Pin`** credential was removed in 0.3.0; `STUDIOFORGE_MCP_PIN` and
+  `TRANSFORGE_PIN_ENV_FILE` are ignored.
 - **Cloud `review` stage** is off by default; when enabled it sends the
   above-the-fold part of each page to the configured API, with a key read from
   the environment variable named by `api_key_env` in `[review]`.

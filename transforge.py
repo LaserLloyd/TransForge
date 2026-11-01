@@ -30,7 +30,7 @@ Commands:
 
 Auth:   StudioForge API key -> `Authorization: Bearer` on every request:
         $TRANSFORGE_LLM_API_KEY (or $STUDIOFORGE_API_KEY, or `api_key_env` /
-        `api_key` in the config). X-MCP-Pin on load/unload is DEPRECATED.
+        `api_key` in the config). The old X-MCP-Pin credential was removed in 0.3.0.
 
 Exit codes: 0 ok · 1 translation/verify failures · 2 usage/config (also: the
             server refused credentials / the lease list with 401/403) ·
@@ -63,10 +63,6 @@ import yaml
 
 CONFIG_PATH = os.path.expanduser("~/.config/transforge/config.toml")
 STATE_DIR = os.path.expanduser("~/.local/state/transforge")
-# Optional file containing a STUDIOFORGE_MCP_PIN=... line, named by
-# $TRANSFORGE_PIN_ENV_FILE. Opt-in only: no location is ever guessed. The
-# STUDIOFORGE_MCP_PIN environment variable takes precedence over the file.
-PIN_ENV_FILE = os.path.expanduser(os.environ.get("TRANSFORGE_PIN_ENV_FILE", ""))
 
 # StudioForge API key, sent as `Authorization: Bearer <key>` on EVERY request
 # (chat, models, status, leases, load/unload). Resolution order, first hit wins:
@@ -166,7 +162,7 @@ class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
     """Never follow an HTTP redirect from the LLM server.
 
     urllib's default handler copies EVERY request header -- `Authorization:
-    Bearer <key>` and `X-MCP-Pin` included -- onto the redirected request, to
+    Bearer <key>` included -- onto the redirected request, to
     whatever host the Location names. The StudioForge / OpenAI-compatible API
     never redirects; a 3xx means a proxy in front of it (typically an SSO
     login) or a wrong endpoint, and following it would hand the key to that
@@ -189,18 +185,15 @@ def _urlopen(req, timeout):
     return _OPENER.open(req, timeout=timeout)
 
 
-_PIN_WARNED = []
+_LEASE_WARNED = []
 
 
-def _warn_pin_deprecated():
-    """Once per process, when the PIN is the ONLY credential a load/unload
-    rides on: the docs say it goes away in the next release, and an operator
-    who never reads a CHANGELOG would otherwise find out from a 401."""
-    if not _PIN_WARNED:
-        _PIN_WARNED.append(True)
-        print("warning: STUDIOFORGE_MCP_PIN (X-MCP-Pin) is deprecated and will "
-              f"be removed in the release after 0.2.0; set ${API_KEY_ENV} to a "
-              "StudioForge API key instead", file=sys.stderr)
+def _warn_no_lease_list(endpoint):
+    """Once per process: /api/leases answered 200 but not with a lease list."""
+    if not _LEASE_WARNED:
+        _LEASE_WARNED.append(True)
+        print(f"warning: /api/leases at {endpoint} did not return a lease list; "
+              "proceeding without benchmark protection", file=sys.stderr)
 
 
 class RigAuthError(RuntimeError):
@@ -218,9 +211,6 @@ def http_refusal_message(e):
     if e.code in (401, 403):
         msg += (f" -- StudioForge requires credentials: set ${API_KEY_ENV} "
                 "(or `api_key_env` / `api_key` in the config)")
-        if str(e.url).endswith(("/load-recommended", "/unload")):
-            msg += ("; a StudioForge that predates API keys wants the "
-                    "(deprecated) STUDIOFORGE_MCP_PIN for load/unload")
     return msg
 
 
@@ -536,27 +526,17 @@ class Rig:
     def __init__(self, site):
         self.base = site.endpoint.rstrip("/")
         self.site = site
-        self._pin = None
 
-    def _req(self, method, path, body=None, pin=False, timeout=30):
+    def _req(self, method, path, body=None, need_key=False, timeout=30):
         headers = {"Content-Type": "application/json", "X-SF-Client": SF_CLIENT}
         key = self.api_key()
         if key:
             headers["Authorization"] = "Bearer " + key
-        if pin:
-            # X-MCP-Pin on load/unload is DEPRECATED (kept for one release:
-            # servers that predate API keys still want it). It is sent whenever
-            # one is available; with an API key it is no longer required.
-            p = self.pin()
-            if p:
-                headers["X-MCP-Pin"] = p
-                if not key:
-                    _warn_pin_deprecated()
-            elif not key:
-                raise RuntimeError(
-                    f"no StudioForge credentials — export ${API_KEY_ENV} "
-                    "(preferred) or STUDIOFORGE_MCP_PIN (deprecated) in the "
-                    "environment; model load/unload calls need one of them")
+        elif need_key:
+            raise RuntimeError(
+                f"no StudioForge API key — export ${API_KEY_ENV} in the "
+                "environment (or set `api_key_env` / `api_key` in the config); "
+                "model load/unload calls need one")
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.base + path, data=data,
                                      headers=headers, method=method)
@@ -583,25 +563,6 @@ class Rig:
         v = str(getattr(self.site, "api_key", "") or "").strip()
         return (v, "config") if v else ("", "")
 
-    def pin(self):
-        """Management PIN (DEPRECATED, superseded by the API key; kept for one
-        release for servers that still gate load/unload on it): environment first, then the opt-in file named by
-        $TRANSFORGE_PIN_ENV_FILE (if set)."""
-        if self._pin is None:
-            self._pin = os.environ.get("STUDIOFORGE_MCP_PIN", "").strip()
-            if self._pin:
-                return self._pin
-            if PIN_ENV_FILE:
-                try:
-                    for line in read_text(PIN_ENV_FILE).splitlines():
-                        m = re.match(r"STUDIOFORGE_MCP_PIN=\"?([^\s\"]+)\"?", line.strip())
-                        if m:
-                            self._pin = m.group(1)
-                            break
-                except OSError:
-                    pass
-        return self._pin
-
     def models(self):
         return self._req("GET", "/v1/models").get("data", [])
 
@@ -621,9 +582,18 @@ class Rig:
         StudioForge (connection refused, DNS, timeout), a server that has no
         /api/leases (404) or answers 5xx: there is then no gate to consult, and
         the very next call (models()/chat) fails with the real error (exit 4).
+
+        A 200 that is not a lease list (non-JSON, not an object, or no list
+        under `leases` -- LM Studio and other servers answer unknown routes
+        with 200 and a JSON error object) also reads as "no lease", but is
+        announced: ONE warning per process on stderr.
         """
         try:
-            return self._req("GET", "/api/leases", timeout=8).get("leases", [])
+            data = self._req("GET", "/api/leases", timeout=8)
+            if isinstance(data, dict) and isinstance(data.get("leases"), list):
+                return data["leases"]
+            _warn_no_lease_list(self.base)
+            return []
         except urllib.error.HTTPError as e:
             e.close()
             if e.code in (401, 403):
@@ -637,6 +607,9 @@ class Rig:
                     f"the lease list answered with a redirect (HTTP {e.code} "
                     f"{e.reason}): cannot tell whether a benchmark holds the "
                     "GPUs, so not proceeding.")
+            return []
+        except ValueError:     # 200 with a body that is not JSON
+            _warn_no_lease_list(self.base)
             return []
         except Exception:
             return []      # unreachable / no such endpoint: documented above
@@ -662,13 +635,13 @@ class Rig:
 
     def unload(self, model_id):
         self._req("POST", f"/api/models/{urllib.parse.quote(model_id, safe='')}/unload",
-                  body={}, pin=True, timeout=120)
+                  body={}, need_key=True, timeout=120)
 
     def load_recommended(self, model_id, ctx_size, priority):
         return self._req(
             "POST",
             f"/api/models/{urllib.parse.quote(model_id, safe='')}/load-recommended",
-            body={"ctx_size": ctx_size, "priority": priority}, pin=True, timeout=600)
+            body={"ctx_size": ctx_size, "priority": priority}, need_key=True, timeout=600)
 
     def wait_ready(self, model_id, timeout_s=900):
         t0 = time.time()
@@ -760,12 +733,12 @@ def warmup(site, rig, quiet=False):
         return workers_for(site, rig)
     # not loaded, or resident on a degenerate plan (e.g. a leftover JIT load:
     # load-recommended would return the existing plan unchanged, so unload first)
-    if not (rig.pin() or rig.api_key()):
+    if not rig.api_key():
         if par > 0:
-            print("warning: model resident with parallel=1 and no API key/PIN to "
+            print("warning: model resident with parallel=1 and no API key to "
                   "re-plan; running serial", file=sys.stderr)
             return 1
-        print("warning: no API key or PIN available — first request will JIT-load "
+        print("warning: no API key available — first request will JIT-load "
               "(slow, planner-default plan)", file=sys.stderr)
         return 1
     if par > 0:

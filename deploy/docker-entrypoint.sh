@@ -102,10 +102,27 @@ pre_upgrade_backup() {
 pre_upgrade_backup
 
 # ---- 4. first-start config seed ---------------------------------------------
+TEMPLATE=/usr/local/share/transforge/config.example.toml
 if [ ! -f "$CFG" ]; then
-    if sed "s|@ENDPOINT@|${ENDPOINT}|" /usr/local/share/transforge/config.example.toml > "$CFG" 2>/dev/null; then
+    # The template ships in the image; if it is gone the image is broken, so
+    # fail instead of limping on without a config.
+    [ -f "$TEMPLATE" ] || die "config template $TEMPLATE is missing (broken image); not seeding $CFG"
+    # Substitute with awk reading the value from the environment: no sed
+    # replacement escaping (|, & and \ in the URL stay literal) and no value
+    # inside a program string. Write to a temp file beside $CFG and mv it into
+    # place, so a failure never leaves a partial or empty config behind.
+    TMP_CFG="${CFG}.seed.$$"
+    if ENDPOINT="$ENDPOINT" awk '
+        BEGIN { ep = ENVIRON["ENDPOINT"]; tok = "@ENDPOINT@"; n = length(tok) }
+        { out = ""; rest = $0
+          while ((i = index(rest, tok)) > 0) {
+              out = out substr(rest, 1, i - 1) ep
+              rest = substr(rest, i + n)
+          }
+          print out rest }' "$TEMPLATE" > "$TMP_CFG" && [ -s "$TMP_CFG" ] && mv "$TMP_CFG" "$CFG"; then
         log "seeded $CFG (endpoint ${ENDPOINT}); edit [sites.*] to point at your trees under /sites"
     else
+        rm -f "$TMP_CFG"
         log "no config at $CFG and it could not be created; see docs/deploy/docker.md"
     fi
 fi
@@ -118,7 +135,13 @@ if [ "${1:-}" = "schedule" ]; then
     log "schedule every ${INTERVAL}s: transforge ${TRANSFORGE_SCHEDULE_CMD}"
     # Heartbeat ticker for the compose healthcheck: runs for the life of this
     # loop, so a translation run that takes longer than the check window does
-    # not flip the container to "unhealthy".
+    # not flip the container to "unhealthy". Trade-off, on purpose: "healthy"
+    # means only that this scheduler loop is alive. It does NOT mean a run is
+    # progressing; a run hung on a stuck LLM server stays "healthy". To see
+    # run outcomes read the container log: this script logs the schedule at
+    # start and "scheduled run exited non-zero (will retry next interval)" when
+    # a run fails, and transforge's own output goes to the same stream. There
+    # is no run timeout mechanism here.
     ( while :; do touch "$HB"; sleep 30; done ) &
     TICK=$!
     CHILD=""

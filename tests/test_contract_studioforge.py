@@ -56,8 +56,7 @@ def http_error_from(fx):
 class _EnvCase(unittest.TestCase):
     def setUp(self):
         env = {k: v for k, v in os.environ.items()
-               if k not in ("TRANSFORGE_LLM_API_KEY", "STUDIOFORGE_API_KEY",
-                            "STUDIOFORGE_MCP_PIN")}
+               if k not in ("TRANSFORGE_LLM_API_KEY", "STUDIOFORGE_API_KEY")}
         env["NO_PROXY"] = env["no_proxy"] = "127.0.0.1,localhost"
         p = mock.patch.dict(os.environ, env, clear=True)
         p.start()

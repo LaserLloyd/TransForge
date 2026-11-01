@@ -30,12 +30,12 @@ sys.modules["transforge_auth_mod"] = tf
 _spec.loader.exec_module(tf)
 
 KEY = "sk-test-0123456789abcdef"
-KEY_ENVS = ("TRANSFORGE_LLM_API_KEY", "STUDIOFORGE_API_KEY", "STUDIOFORGE_MCP_PIN",
+KEY_ENVS = ("TRANSFORGE_LLM_API_KEY", "STUDIOFORGE_API_KEY",
             "MY_CUSTOM_KEY_VAR")
 
 
 def clean_env(**extra):
-    """os.environ without any key/PIN variables, plus *extra*, and a proxy
+    """os.environ without any key variables, plus *extra*, and a proxy
     bypass for loopback (a developer machine may export HTTP_PROXY)."""
     env = {k: v for k, v in os.environ.items() if k not in KEY_ENVS}
     env["NO_PROXY"] = env["no_proxy"] = "127.0.0.1,localhost"
@@ -56,9 +56,6 @@ class _EnvCase(unittest.TestCase):
         p = mock.patch.dict(os.environ, clean_env(**extra), clear=True)
         p.start()
         self.addCleanup(p.stop)
-        q = mock.patch.object(tf, "PIN_ENV_FILE", "")
-        q.start()
-        self.addCleanup(q.stop)
 
 
 class TestBearerKeyResolution(_EnvCase):
@@ -114,7 +111,7 @@ class TestBearerHeaderOnTheWire(_EnvCase):
         return sf
 
     def test_every_request_carries_the_bearer_header(self):
-        self.use_env(TRANSFORGE_LLM_API_KEY=KEY, STUDIOFORGE_MCP_PIN="1234abcd")
+        self.use_env(TRANSFORGE_LLM_API_KEY=KEY)
         with self._server() as sf:
             rig = tf.Rig(make_site(endpoint=sf.url, model="vendor/m"))
             rig.models()
@@ -141,18 +138,18 @@ class TestBearerHeaderOnTheWire(_EnvCase):
             tf.Rig(make_site(endpoint=sf.url, api_key=KEY)).status()
         self.assertEqual(sf.requests[0]["headers"]["Authorization"], "Bearer " + KEY)
 
-    def test_pin_still_sent_on_load_and_unload_but_not_elsewhere(self):
-        """Deprecated for one release: X-MCP-Pin keeps riding load/unload."""
-        self.use_env(TRANSFORGE_LLM_API_KEY=KEY, STUDIOFORGE_MCP_PIN="1234abcd")
-        with self._server() as sf:
+    def test_removed_pin_env_vars_are_ignored(self):
+        """0.3.0 dropped X-MCP-Pin: the old env vars change nothing."""
+        self.use_env(TRANSFORGE_LLM_API_KEY=KEY, STUDIOFORGE_MCP_PIN="1234abcd",
+                     TRANSFORGE_PIN_ENV_FILE="/nonexistent")
+        err = io.StringIO()
+        with self._server() as sf, contextlib.redirect_stderr(err):
             rig = tf.Rig(make_site(endpoint=sf.url))
-            rig.models()
             rig.load_recommended("vendor/m", 16384, 3)
             rig.unload("vendor/m")
-        by_path = {r["path"].split("/")[-1]: r["headers"] for r in sf.requests}
-        self.assertNotIn("X-MCP-Pin", by_path["models"])
-        self.assertEqual(by_path["load-recommended"]["X-MCP-Pin"], "1234abcd")
-        self.assertEqual(by_path["unload"]["X-MCP-Pin"], "1234abcd")
+        for r in sf.requests:
+            self.assertNotIn("X-MCP-Pin", r["headers"])
+        self.assertEqual(err.getvalue(), "")
 
     def test_api_key_alone_is_enough_for_load(self):
         self.use_env(TRANSFORGE_LLM_API_KEY=KEY)
@@ -160,14 +157,16 @@ class TestBearerHeaderOnTheWire(_EnvCase):
             tf.Rig(make_site(endpoint=sf.url)).load_recommended("vendor/m", 8192, 3)
         h = sf.requests[0]["headers"]
         self.assertEqual(h["Authorization"], "Bearer " + KEY)
-        self.assertNotIn("X-MCP-Pin", h)
 
     def test_load_without_any_credential_is_still_refused_locally(self):
-        self.use_env()
+        self.use_env(STUDIOFORGE_MCP_PIN="1234abcd")     # the PIN no longer counts
         rig = tf.Rig(make_site(endpoint="http://127.0.0.1:9"))
-        with self.assertRaises(RuntimeError) as cm:
-            rig.load_recommended("vendor/m", 8192, 3)
-        self.assertIn("TRANSFORGE_LLM_API_KEY", str(cm.exception))
+        for call in (lambda: rig.load_recommended("vendor/m", 8192, 3),
+                     lambda: rig.unload("vendor/m")):
+            with self.assertRaises(RuntimeError) as cm:
+                call()
+            self.assertIn("TRANSFORGE_LLM_API_KEY", str(cm.exception))
+            self.assertIn("api_key_env", str(cm.exception))
 
 
 class TestKeyIsNeverShown(_EnvCase):
@@ -379,8 +378,8 @@ class TestMainHandlesRigErrorsForEveryCommand(_EnvCase):
 
 
 class TestRedirectsAreNotFollowed(_EnvCase):
-    """urllib's default redirect handler re-sends every header (Authorization,
-    X-MCP-Pin) to whatever host Location names. The rig client must not follow
+    """urllib's default redirect handler re-sends every header (Authorization)
+    to whatever host Location names. The rig client must not follow
     a redirect at all, and a redirected lease list must fail closed."""
 
     def _front_and_back(self, front, back, path):
@@ -388,8 +387,8 @@ class TestRedirectsAreNotFollowed(_EnvCase):
                     headers={"Location": back.url + path})
         back.route("GET", path, 200, {"leases": [], "data": []})
 
-    def test_bearer_key_and_pin_never_reach_the_redirect_target(self):
-        self.use_env(TRANSFORGE_LLM_API_KEY=KEY, STUDIOFORGE_MCP_PIN="1234abcd")
+    def test_bearer_key_never_reaches_the_redirect_target(self):
+        self.use_env(TRANSFORGE_LLM_API_KEY=KEY)
         with FakeStudioForge() as front, FakeStudioForge() as back:
             self._front_and_back(front, back, "/v1/models")
             rig = tf.Rig(make_site(endpoint=front.url))
@@ -442,34 +441,52 @@ class TestRedirectsAreNotFollowed(_EnvCase):
         self.assertEqual(back.requests, [])
 
 
-class TestPinDeprecationNotice(_EnvCase):
-    def _load(self, sf):
-        tf.Rig(make_site(endpoint=sf.url)).load_recommended("vendor/m", 8192, 3)
+class TestLeaseListShape(_EnvCase):
+    """A 200 from /api/leases that is not a lease list stays fail-open (other
+    servers answer unknown routes with 200) but warns once per process."""
 
     def setUp(self):
-        p = mock.patch.object(tf, "_PIN_WARNED", [])
+        p = mock.patch.object(tf, "_LEASE_WARNED", [])
         p.start()
         self.addCleanup(p.stop)
+        self.use_env()
 
-    def test_pin_as_the_only_credential_warns_once(self):
-        self.use_env(STUDIOFORGE_MCP_PIN="1234abcd")
+    def _leases(self, status, payload, calls=2):
         err = io.StringIO()
         with FakeStudioForge() as sf, contextlib.redirect_stderr(err):
-            sf.route("POST", "/api/models/", 200, {"ok": True}, exact=False)
-            self._load(sf)
-            self._load(sf)
-        self.assertEqual(err.getvalue().count("STUDIOFORGE_MCP_PIN"), 1)
-        self.assertIn("deprecated", err.getvalue())
-        self.assertIn("TRANSFORGE_LLM_API_KEY", err.getvalue())
-        self.assertNotIn("1234abcd", err.getvalue())
+            sf.route("GET", "/api/leases", status, payload)
+            rig = tf.Rig(make_site(endpoint=sf.url))
+            out = [rig.leases() for _ in range(calls)]
+            self.assertIsNone(rig.bench_lease())
+        return out, err.getvalue(), sf.url
 
-    def test_no_notice_when_an_api_key_is_set(self):
-        self.use_env(TRANSFORGE_LLM_API_KEY=KEY, STUDIOFORGE_MCP_PIN="1234abcd")
-        err = io.StringIO()
-        with FakeStudioForge() as sf, contextlib.redirect_stderr(err):
-            sf.route("POST", "/api/models/", 200, {"ok": True}, exact=False)
-            self._load(sf)
-        self.assertEqual(err.getvalue(), "")
+    def _assert_warned_once(self, out, err, url):
+        self.assertEqual(out, [[], []])
+        self.assertEqual(err.count("did not return a lease list"), 1)
+        self.assertIn(url, err)
+        self.assertEqual(err.count("warning:"), 1)
+
+    def test_html_body_warns_once(self):
+        self._assert_warned_once(*self._leases(200, b"<html>login</html>"))
+
+    def test_error_object_warns(self):
+        self._assert_warned_once(*self._leases(200, {"error": "unknown route"}))
+
+    def test_non_object_json_warns(self):
+        self._assert_warned_once(*self._leases(200, [1, 2]))
+
+    def test_non_list_leases_warns_without_typeerror(self):
+        self._assert_warned_once(*self._leases(200, {"leases": {"a": 1}}))
+
+    def test_empty_list_is_silent(self):
+        out, err, _ = self._leases(200, {"leases": []})
+        self.assertEqual(out, [[], []])
+        self.assertEqual(err, "")
+
+    def test_404_is_silent(self):
+        out, err, _ = self._leases(404, {"error": "nope"})
+        self.assertEqual(out, [[], []])
+        self.assertEqual(err, "")
 
 
 if __name__ == "__main__":
