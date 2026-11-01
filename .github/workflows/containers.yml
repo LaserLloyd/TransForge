@@ -48,15 +48,15 @@ jobs:
     env:
       PUBLISH: ${{ startsWith(github.ref, 'refs/tags/v') }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
         if: env.PUBLISH == 'true'
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GHCR
         if: env.PUBLISH == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -64,7 +64,7 @@ jobs:
 
       - name: Image metadata (tags + OCI labels)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.IMAGE }}
           tags: |
@@ -78,7 +78,7 @@ jobs:
       # Tag builds: amd64 + arm64, pushed.
       - name: Build (and push on a tag)
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           push: ${{ env.PUBLISH == 'true' }}
@@ -120,7 +120,7 @@ jobs:
 
       # --- SBOM (syft -> CycloneDX) + checksums ---------------------------------
       - name: SBOM (CycloneDX)
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
           image: ${{ steps.ref.outputs.image }}
           format: cyclonedx-json
@@ -130,7 +130,7 @@ jobs:
       - name: SHA256SUMS
         run: sha256sum sbom.cdx.json > SHA256SUMS
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sbom-and-checksums
           path: |
@@ -140,7 +140,7 @@ jobs:
       # --- everything below is tag-only ------------------------------------------
       - name: Install cosign
         if: env.PUBLISH == 'true'
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
       - name: Sign the image (cosign, keyless)
         if: env.PUBLISH == 'true'
@@ -154,7 +154,7 @@ jobs:
 
       - name: Build provenance attestation
         if: env.PUBLISH == 'true'
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.build.outputs.digest }}

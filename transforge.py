@@ -2174,6 +2174,145 @@ def cmd_config(args, sites):
     return 0
 
 
+# ------------------------------------------------------------------ log file
+LOG_MAX_BYTES = 1_000_000
+
+
+def log_event(event, **fields):
+    """Append one JSON line to STATE_DIR/transforge.log (rotated to .1 at 1 MB).
+
+    Metadata only -- command names, counts, exit codes, never page text or
+    keys. Best-effort: a log that cannot be written never fails a command."""
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        path = os.path.join(STATE_DIR, "transforge.log")
+        try:
+            if os.path.getsize(path) > LOG_MAX_BYTES:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
+        row = {"ts": now_iso(), "event": event, **fields}
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------- init
+INIT_TEMPLATE = """\
+[defaults]
+endpoint = "{endpoint}"
+model = "{model}"
+
+[sites.{name}]
+root = "{root}"
+content_dirs = ["content/projects", "content/pages"]
+languages = [{languages}]
+lang_names = {{ {lang_names} }}
+link_dirs = ["projects"]
+no_translate = []
+translate_fields = ["title", "excerpt"]
+"""
+
+_LANG_NAMES = {"ja": "Japanese", "de": "German", "fr": "French", "es": "Spanish",
+               "it": "Italian", "pt": "Portuguese", "ko": "Korean", "zh": "Chinese",
+               "ar": "Arabic", "ru": "Russian", "nl": "Dutch"}
+
+
+def _toml_str(value):
+    return json.dumps(str(value))[1:-1]     # JSON string escapes are valid TOML basic-string escapes
+
+
+def cmd_init(args):
+    """Write a starter config.toml. Never overwrites without --force."""
+    name = args.name
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+        die(f"--name must be letters, digits, '-' or '_' (got {name!r})")
+    langs = [x.strip() for x in args.languages.split(",") if x.strip()]
+    if not langs or not all(re.fullmatch(r"[A-Za-z]{2,3}(-[A-Za-z0-9]+)?", x) for x in langs):
+        die(f"--languages must be a comma list of language codes (got {args.languages!r})")
+    if os.path.exists(CONFIG_PATH) and not args.force:
+        die(f"{CONFIG_PATH} already exists; edit it, or pass --force to overwrite", 1)
+    text = INIT_TEMPLATE.format(
+        endpoint=_toml_str(args.endpoint), model=_toml_str(args.model),
+        name=name, root=_toml_str(args.root),
+        languages=", ".join(f'"{_toml_str(x)}"' for x in langs),
+        lang_names=", ".join(f'{_toml_str(x)} = "{_LANG_NAMES.get(x, x)}"' for x in langs))
+    tomllib.loads(text)                     # never write a file we could not read back
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    write_atomic(CONFIG_PATH, text, 0o600)
+    print(f"wrote {CONFIG_PATH}")
+    print("next: edit `root` and `model`, export TRANSFORGE_LLM_API_KEY if the "
+          "gateway needs a key, then `transforge doctor`")
+    log_event("init", config=CONFIG_PATH)
+    return 0
+
+
+# ------------------------------------------------------------------- doctor
+def cmd_doctor(args):
+    """Check config, site folders, the rig and the key. Read-only: no model is
+    loaded and no translation is started. Exit 0 all good, 1 a check failed."""
+    rows = []
+
+    def row(ok, what, detail=""):
+        rows.append((ok, what, detail))
+
+    if not os.path.isfile(CONFIG_PATH):
+        row(False, "config", f"{CONFIG_PATH} not found -- run `transforge init`")
+        sites = {}
+    else:
+        try:
+            with open(CONFIG_PATH, "rb") as f:
+                cfg = tomllib.load(f)
+            defaults = cfg.get("defaults", {})
+            sites = {n: SiteConfig(n, defaults, sc) for n, sc in cfg.get("sites", {}).items()}
+            row(bool(sites), "config", CONFIG_PATH if sites else "no [sites.*] sections")
+        except tomllib.TOMLDecodeError as e:
+            row(False, "config", f"not valid TOML: {e}")
+            sites = {}
+        except SystemExit:
+            row(False, "config", "a site section is invalid (see the message above)")
+            sites = {}
+    if args.site and sites and args.site not in sites:
+        row(False, "site", f"no site named {args.site!r} (have: {', '.join(sites)})")
+        sites = {}
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        probe = os.path.join(STATE_DIR, ".doctor-probe")
+        with open(probe, "w") as f:
+            f.write("x")
+        os.remove(probe)
+        row(True, "state dir", STATE_DIR)
+    except OSError as e:
+        row(False, "state dir", f"{STATE_DIR} is not writable: {e}")
+    for name, site in sites.items():
+        if args.site and name != args.site:
+            continue
+        row(os.path.isdir(site.root), f"[{name}] root", site.root)
+        for d in site.content_dirs:
+            row(os.path.isdir(os.path.join(site.root, d)), f"[{name}] content dir", d)
+        row(bool(site.languages), f"[{name}] languages", ", ".join(site.languages) or "none set")
+        rig = Rig(site)
+        src = rig.api_key_source()
+        row(True, f"[{name}] api key", f"set (from {src})" if src else "not set (fine if the gateway needs none)")
+        try:
+            ids = [m.get("id") for m in rig.models()]
+            row(True, f"[{name}] rig", f"{site.endpoint} answers ({len(ids)} models)")
+            row(site.model in ids, f"[{name}] model", site.model if site.model in ids
+                else f"{site.model!r} is not offered; `transforge models` lists the ids")
+        except urllib.error.HTTPError as e:
+            row(False, f"[{name}] rig", http_refusal_message(e))
+        except (urllib.error.URLError, ConnectionError, TimeoutError, RigAuthError,
+                ValueError, OSError) as e:
+            row(False, f"[{name}] rig", f"{site.endpoint} unreachable: {e}")
+    for ok, what, detail in rows:
+        print(f"{'ok  ' if ok else 'FAIL'} {what}: {detail}")
+    failed = [w for ok, w, _ in rows if not ok]
+    print("all checks passed" if not failed else f"{len(failed)} check(s) failed")
+    log_event("doctor", failed=len(failed))
+    return 0 if not failed else 1
+
+
 # -------------------------------------------------------------------- main
 def package_version():
     """Installed distribution version; 'unknown' when run from a bare checkout."""
@@ -2242,6 +2381,15 @@ def main():
     p = sub.add_parser("models"); common(p, langs=False)
     p = sub.add_parser("report"); p.add_argument("--append")
     p = sub.add_parser("config"); p.add_argument("--site")
+    p = sub.add_parser("init", help="write a starter config.toml")
+    p.add_argument("--name", default="example", help="site name (default: example)")
+    p.add_argument("--root", default="~/sites/example", help="site folder")
+    p.add_argument("--languages", default="ja,de", help="comma list of target languages")
+    p.add_argument("--endpoint", default="http://localhost:1234")
+    p.add_argument("--model", default="publisher/repo/file-stem")
+    p.add_argument("--force", action="store_true", help="overwrite an existing config")
+    p = sub.add_parser("doctor", help="check config, folders, the rig and the key (read-only)")
+    p.add_argument("--site")
 
     # cloud review stage lives in review.py (resolve through the install symlink)
     sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
@@ -2249,6 +2397,8 @@ def main():
     _review.add_cli(sub)
 
     args = ap.parse_args()
+    if args.cmd in ("init", "doctor"):      # must work before a valid config exists
+        sys.exit({"init": cmd_init, "doctor": cmd_doctor}[args.cmd](args))
     _, sites = load_config()
     fn = {"status": cmd_status, "plan": cmd_plan, "run": cmd_run,
           "single": cmd_single, "text": cmd_text, "accept": cmd_accept,
@@ -2269,6 +2419,8 @@ def main():
     except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
         print(f"rig unreachable: {e}", file=sys.stderr)
         rc = 4
+    if args.cmd in ("run", "single", "text", "accept", "warmup", "review"):
+        log_event("command", cmd=args.cmd, exit=rc)
     sys.exit(rc)
 
 

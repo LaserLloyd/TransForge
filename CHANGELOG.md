@@ -5,6 +5,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
 
 ## 0.3.0 — 2026-11-01
 
+### Added
+- `transforge init` writes a starter `config.toml` (never overwrites without
+  `--force`; `--name/--root/--languages/--endpoint/--model`) (#7).
+- `transforge doctor` checks the config, site folders, the state directory, the
+  API key source, that the rig answers and offers the configured model. It is
+  read-only: no model is loaded and nothing is translated. Exit 0 or 1 (#8).
+- `~/.local/state/transforge/transforge.log`: one JSON line per
+  run/single/text/accept/warmup/review/init/doctor (command, exit code; no page
+  text, no keys), rotated to `.1` at 1 MB (#8).
+
+### Fixed
+- `uv.lock` records 0.3.0, so `uv sync --locked` in the container build passes.
+
 ### Removed
 - **The `X-MCP-Pin` credential** (`STUDIOFORGE_MCP_PIN`, `TRANSFORGE_PIN_ENV_FILE`),
   deprecated in 0.2.0. Both variables are now ignored. The StudioForge API key

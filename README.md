@@ -232,6 +232,7 @@ docker compose -f deploy/compose/compose.yml run --rm app status --all
 ### First run (native installs)
 
 TransForge reads `~/.config/transforge/config.toml` (on Windows `%USERPROFILE%\.config\transforge\config.toml`) and refuses to start without it.
+`transforge init` writes a starter file for you and `transforge doctor` checks it (add `--force` to `init` to overwrite); each command run is also logged, metadata only, to `~/.local/state/transforge/transforge.log`.
 Write a minimal one, point `endpoint` at the gateway root (no `/v1`), and set `model` to a full StudioForge model id (`transforge models` lists them).
 
 ```bash
@@ -430,6 +431,8 @@ transforge warmup [--site X]                  load the model on a sane plan
 transforge models                             rig models, with loaded plans (the command that checks the rig)
 transforge report [--append FILE]             one-shot text report (cron-friendly)
 transforge config [--site X]                  resolved config + cfg_hash
+transforge init [--force]                     write a starter config.toml
+transforge doctor [--site X]                  read-only checks: config, folders, rig, model, key
 transforge review [--site X] [--langs ..] [--files ..] [--dry-run]
                   [--include-edited] [--limit N]
 ```
